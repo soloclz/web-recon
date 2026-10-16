@@ -16,6 +16,37 @@ def _elapsed(seconds: float) -> str:
     return f"{minutes}m{remainder:02d}s" if minutes else f"{remainder}s"
 
 
+_STAGE_LABELS = {
+    "resolution": "hostname resolution",
+    "dns": "DNS checks",
+    "dns-words": "DNS wordlist scan",
+    "scheme": "HTTP/HTTPS probe",
+    "tls": "TLS certificate",
+    "public": "public sources",
+}
+
+
+def _display_stage(stage: str, scan: str | None) -> str:
+    parts = stage.split(":")
+    if len(parts) == 3 and parts[0] == "scanner":
+        _, scheme, purpose = parts
+        name = {"paths": "path", "extensions": "extension",
+                "extension-filenames": "filename"}.get(purpose, purpose)
+        label = f"{scheme.upper()} {name} scan"
+        if scan and scan != purpose:
+            if scan.startswith("extension-stem-") and scan.removeprefix("extension-stem-").isdigit():
+                detail = f"known filename #{scan.removeprefix('extension-stem-')}"
+            elif scan.startswith("extension-filenames-") and scan.removeprefix("extension-filenames-").isdigit():
+                detail = f"filename guesses #{scan.removeprefix('extension-filenames-')}"
+            else:
+                detail = scan
+            label += f" ({detail})"
+        return label
+    if len(parts) == 2 and parts[0] == "web":
+        return f"{parts[1].upper()} Web checks"
+    return _STAGE_LABELS.get(stage, stage)
+
+
 class ProgressReporter:
     """Append events immediately and show a bounded heartbeat in the terminal."""
 
@@ -44,21 +75,19 @@ class ProgressReporter:
                   "elapsed_seconds": elapsed, **details}
         with self.path.open("a", encoding="utf-8") as output:
             output.write(json.dumps(record, ensure_ascii=False) + "\n")
-        message = f"[{host}] {stage}"
         scan = details.get("scan", state.get("scan"))
         current = details.get("current", state.get("current"))
         total = details.get("total", state.get("total"))
-        if scan:
-            message += f"/{scan}"
+        message = f"[{host}] {_display_stage(stage, scan if isinstance(scan, str) else None)}"
         if event == "start":
             message += " started"
         elif event == "finish":
             message += f" {details.get('status', 'error')} ({_elapsed(elapsed)})"
         elif isinstance(current, int) and isinstance(total, int) and total > 0:
             percent = 100 * current / total
-            message += f" {current}/{total} ({percent:.0f}%), {_elapsed(elapsed)}"
+            message += f" {current:,}/{total:,} tried ({percent:.0f}%), elapsed {_elapsed(elapsed)}"
         else:
-            message += f" running {_elapsed(elapsed)}"
+            message += f" running, elapsed {_elapsed(elapsed)}"
         print(message, file=sys.stderr, flush=True)
 
     def start(self, host: str, stage: str) -> None:

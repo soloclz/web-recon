@@ -344,6 +344,28 @@ class FuzzTests(unittest.TestCase):
         self.assertEqual(json.loads((self.root / "out" / "paths.status.json").read_text())["returncode"], None)
         self.assertIn(b"Progress: [0/1]", (self.root / "out" / "paths.stderr").read_bytes())
 
+    def test_large_wordlist_extends_streaming_scan_timeout(self):
+        names = self.wordlist("names.txt", "# comment\n" + "admin\n" * 50)
+        observed = []
+
+        def stream(argv, name, stdout, stderr, progress, timeout):
+            observed.append(timeout)
+            Path(argv[argv.index("-o") + 1]).write_text(json.dumps({"results": []}), encoding="utf-8")
+            stderr.write_bytes(b"")
+            return 0, False
+
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), \
+             patch.object(fuzz, "_save_controls", return_value=([BASELINE, BASELINE], [], [])), \
+             patch.object(fuzz, "RATE", 1), patch.object(fuzz, "TIMEOUT", 10), \
+             patch.object(fuzz, "_run_with_progress", side_effect=stream):
+            report = fuzz.run_vhost("http://box.htb", "box.htb", names, self.root / "out",
+                                    progress=lambda *_: None)
+
+        self.assertEqual(report["status"], "completed")
+        self.assertEqual(observed, [75])
+        status = json.loads((self.root / "out" / "vhost.status.json").read_text())
+        self.assertEqual(status["timeout_seconds"], 75)
+
 
 if __name__ == "__main__":
     unittest.main()

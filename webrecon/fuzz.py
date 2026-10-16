@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import math
 import re
 import secrets
 import shutil
@@ -26,6 +27,13 @@ BODY_LIMIT = 1024 * 1024
 MAX_BASENAMES = 25
 _LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 _FFUF_PROGRESS = re.compile(rb":: Progress: \[(\d+)/(\d+)\]")
+
+
+def _scan_timeout(wordlist: Path) -> float:
+    """Allow a rate-limited wordlist enough time to finish, with finite slack."""
+    with wordlist.open("rb") as source:
+        entries = sum(1 for line in source if line.strip() and not line.lstrip().startswith(b"#"))
+    return max(TIMEOUT, math.ceil(entries / RATE * 1.5))
 
 
 def _report(status: str, **more: object) -> dict:
@@ -160,6 +168,7 @@ def _extension_assessment(hit: dict, controls: list[dict]) -> str:
 def _run_with_progress(
     args: list[str], name: str, stdout: Path, stderr: Path,
     progress: Callable[[str, int, int], None],
+    timeout: float,
 ) -> tuple[int | None, bool]:
     """Keep ffuf's raw streams and report the latest counter while it runs."""
     timed_out = False
@@ -167,7 +176,7 @@ def _run_with_progress(
         process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=stdout_file, stderr=stderr_file)
         try:
             with stderr.open("rb") as progress_file:
-                deadline = time.monotonic() + TIMEOUT
+                deadline = time.monotonic() + timeout
                 tail = b""
                 last_count: tuple[int, int] | None = None
                 while True:
@@ -218,15 +227,16 @@ def _scan(
     artifacts = [str(stdout), str(stderr), str(status_path)]
     diagnostics: list[str] = []
     try:
+        timeout = _scan_timeout(wordlist)
         if progress is None:
-            completed = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=TIMEOUT, check=False)
+            completed = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, check=False)
             stdout.write_bytes(completed.stdout)
             stderr.write_bytes(completed.stderr)
             returncode = completed.returncode
         else:
-            returncode, timed_out = _run_with_progress(args, name, stdout, stderr, progress)
+            returncode, timed_out = _run_with_progress(args, name, stdout, stderr, progress, timeout)
             if timed_out:
-                diagnostics.append(f"{name}: ffuf timed out after {TIMEOUT} seconds")
+                diagnostics.append(f"{name}: ffuf timed out after {timeout:g} seconds")
     except OSError as exc:
         stdout.write_bytes(b"")
         stderr.write_text(f"{type(exc).__name__}: {exc}\n", encoding="utf-8")
@@ -237,8 +247,9 @@ def _scan(
         stdout.write_bytes(exc.stdout or b"")
         stderr.write_bytes(exc.stderr or b"")
         returncode = None
-        diagnostics.append(f"{name}: ffuf timed out after {TIMEOUT} seconds")
-    status_path.write_text(json.dumps({"argv": args, "returncode": returncode}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        diagnostics.append(f"{name}: ffuf timed out after {timeout:g} seconds")
+    status_path.write_text(json.dumps({"argv": args, "returncode": returncode,
+                                       "timeout_seconds": timeout}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if not output.exists():
         diagnostics.append(f"{name}: ffuf did not write JSON output")
         return [], artifacts, diagnostics, "error"
