@@ -54,8 +54,18 @@ hosts/<hostname>-<hash>/public/
 ```bash
 python3 -m unittest discover -s tests -v
 python3 -m py_compile webrecon/*.py scripts/*.py
+python3 verification/local_web.py
 ```
 
-單元測試使用假的 DNS、HTTP、公共來源和 scanner 輸出。Kali 的 `ffuf`、`gobuster`、`dig` 與受控 Web／DNS 服務整合測試須在能連到 Kali 的環境執行，並以當地安裝版本的 `--help` 和原始輸出核對。
+單元測試使用假的 DNS、HTTP、公共來源和 scanner 輸出。`local_web.py` 以受控 Web 服務執行完整 CLI。在 Kali 執行實際安裝的 `ffuf`、`gobuster` 和 `dig`：
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 verification/local_web.py
+python3 verification/kali_scanners.py
+python3 verification/kali_dns.py
+```
+
+後兩個腳本在 loopback 啟動受控 Web／DNS 服務並保存 scanner 原始 output；`kali_dns.py` 僅在測試過程為 `dig` 和 `gobuster` 指定受控 DNS server，平常執行 CLI 仍使用系統設定的 resolver。腳本會印出原始 output 的暫存目錄。
 
 來源：`pentest-notes` 的 `discovery/`、`web/` 與 `scripts/web-summary.py`，以及 `sec-notes` 的 `recon/`、`protocols/` 與 `cheatsheets/`。`web-summary.py` 複製自 `pentest-notes` commit `b602578fd06756ae8b3bea6020991994d3ad8976`。

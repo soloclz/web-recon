@@ -18,7 +18,9 @@ from pathlib import Path
 RECORD_TYPES = ("A", "AAAA", "CNAME", "MX", "TXT", "CAA", "SOA", "NS")
 _HOST_RE = re.compile(r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _DIG_STATUS_RE = re.compile(r"\bstatus:\s*([A-Z]+)")
-_GOBUSTER_FOUND_RE = re.compile(r"^\s*Found:\s+(\S+)(?:\s+\[([^\]]+)\])?", re.I)
+_GOBUSTER_FOUND_RE = re.compile(
+    r"^\s*(?:Found:\s+)?(\S+)(?:\s+(?:\[([^\]]+)\]|(\S+)))?\s*$", re.I
+)
 _RR_RE = re.compile(r"^(\S+)\s+(\d+)\s+(IN|CH|HS)\s+([A-Z0-9]+)\s+(.+)$", re.I)
 
 
@@ -299,7 +301,7 @@ def run_dns(host: str, ips: list[str], prefix_wordlist: Path | None,
                 found_name = found.group(1).rstrip(".").lower()
                 if not found_name.endswith(f".{host}"):
                     continue
-                address_text = found.group(2) or ""
+                address_text = found.group(2) or found.group(3) or ""
                 addresses = re.findall(r"(?:\d{1,3}\.){3}\d{1,3}|[0-9a-f:]{2,}",
                                        address_text, re.I)
                 candidate_addresses = []

@@ -209,8 +209,28 @@ def _scan(out_dir: Path, name: str, wordlist: Path, url: str, *, host_header: st
 
 def _fuzz_input(hit: dict) -> str | None:
     raw = hit.get("input", {}).get("FUZZ")
-    # ffuf's "json" format stores the original word.  Only "ejson" encodes it.
+    # Some ffuf 2.1.0-dev builds replace this with an auto-calibration word.
+    # Use the rendered request host or URL where they identify the word.
     return raw if isinstance(raw, str) else None
+
+
+def _vhost_prefix(hit: dict, host: str) -> str | None:
+    requested_host = hit.get("host")
+    if isinstance(requested_host, str):
+        suffix = f".{host}".lower()
+        requested_host = requested_host.lower()
+        if requested_host.endswith(suffix):
+            return requested_host[: -len(suffix)]
+        return None
+    return _fuzz_input(hit)
+
+
+def _rendered_extension(hit: dict, origin: str, stem: str, extensions: list[str]) -> str | None:
+    requested_url = hit.get("url")
+    if isinstance(requested_url, str):
+        return next((extension for extension in extensions
+                     if requested_url == f"{origin}/{stem}{extension}"), None)
+    return _fuzz_input(hit)
 
 
 def _hostname(value: str) -> bool:
@@ -260,7 +280,7 @@ def run_vhost(origin: str, host: str, wordlist: Path | None, out_dir: Path) -> d
     uncertain_hits = []
     baseline_matches = 0
     for hit in hits:
-        prefix = _fuzz_input(hit)
+        prefix = _vhost_prefix(hit, host)
         if not prefix or not _hostname(prefix):
             diagnostics.append("vhost: skipped result with invalid prefix")
             continue
@@ -441,7 +461,7 @@ def run_extensions(
         if scan_status == "unavailable":
             break
         for hit in hits:
-            extension = _fuzz_input(hit)
+            extension = _rendered_extension(hit, origin, stem, extensions)
             if extension not in extensions:
                 continue
             assessment = _extension_assessment(hit, extension_controls(extension))

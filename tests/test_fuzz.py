@@ -79,6 +79,16 @@ class FuzzTests(unittest.TestCase):
         self.assertEqual(report["uncertain_hits"][0]["assessment"], "baseline_unavailable")
         self.assertTrue((self.root / "out" / "vhost.json").is_file())
 
+    def test_vhost_uses_rendered_host_when_ffuf_input_is_calibration_word(self):
+        names = self.wordlist("names.txt", "admin\n")
+        rendered = hit(".htaccessORbOkMKu", "http://box.htb:8080/", length=500)
+        rendered["host"] = "admin.box.htb"
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), patch.object(
+            fuzz, "_save_controls", return_value=([BASELINE, BASELINE], [], [])
+        ), patch.object(fuzz.subprocess, "run", side_effect=self.scanner({"vhost": [rendered]})):
+            report = fuzz.run_vhost("http://box.htb:8080", "box.htb", names, self.root / "out")
+        self.assertEqual([item["hostname"] for item in report["candidates"]], ["admin.box.htb"])
+
     def test_paths_keep_only_hits_different_from_missing_path(self):
         names = self.wordlist("paths.txt", "fallback\nadmin\n")
         results = {
@@ -132,6 +142,24 @@ class FuzzTests(unittest.TestCase):
         self.assertEqual((self.root / "out" / "extensions.normalized.txt").read_text(), ".php\n.txt\n")
         self.assertEqual(controls.call_count, 1)
         self.assertEqual(controls.call_args.kwargs["path_suffix"], ".php")
+
+    def test_extension_uses_rendered_url_when_ffuf_input_is_calibration_word(self):
+        extensions = self.wordlist("extensions.txt", "php\n")
+        paths = self.wordlist("paths.txt", "admin\n")
+        results = {
+            "extension-stem-1": [hit(".htaccessORbOkMKu", "http://box.htb/index.php", length=400)],
+            "extension-filenames-1": [hit(".htaccessORbOkMKu", "http://box.htb/admin.php", length=450)],
+        }
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), patch.object(
+            fuzz.subprocess, "run", side_effect=self.scanner(results)
+        ), patch.object(fuzz, "_save_controls", return_value=([BASELINE, BASELINE], [], [])):
+            report = fuzz.run_extensions(
+                "http://box.htb", paths, extensions, [], self.root / "out", 1
+            )
+        self.assertEqual(report["confirmed_extensions"], [".php"])
+        self.assertEqual(report["extra_request_count"], 1)
+        self.assertEqual([item["url"] for item in report["candidates"]],
+                         ["http://box.htb/index.php", "http://box.htb/admin.php"])
 
     def test_php_fallback_does_not_confirm_extension_or_scan_names(self):
         extensions = self.wordlist("extensions.txt", ".php\n")

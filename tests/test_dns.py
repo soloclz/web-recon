@@ -49,6 +49,7 @@ class DnsTest(unittest.TestCase):
             if args[0] == "gobuster":
                 return subprocess.CompletedProcess(
                     args, 0, "Found: admin.example.test [192.0.2.99]\n"
+                    "api.example.test 192.0.2.40\n"
                     "Found: other.invalid [192.0.2.80]\n", "")
             if "AXFR" in args:
                 output = ("example.test. 300 IN SOA ns.example.test. hostmaster.example.test. 1 1 1 1 1\n"
@@ -90,6 +91,9 @@ class DnsTest(unittest.TestCase):
             admin = next(item for item in result["candidates"] if item["name"] == "admin.example.test")
             self.assertEqual("gobuster_dns", admin["source"])
             self.assertTrue(admin["wildcard_match"])
+            api = next(item for item in result["candidates"] if item["name"] == "api.example.test")
+            self.assertEqual("gobuster_dns", api["source"])
+            self.assertEqual(["192.0.2.40"], api["addresses"])
             self.assertIn("ptr.example.test", [item["name"] for item in result["candidates"]])
             self.assertNotIn("other.invalid", [item["name"] for item in result["candidates"]])
             self.assertIn(["dig", "@ns.example.test", "example.test", "AXFR", "+time=3", "+tries=1"], commands)
