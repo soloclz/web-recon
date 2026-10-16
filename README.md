@@ -48,6 +48,30 @@ python3 scripts/web-recon.py --from-run ./runs/example \
 同時傳 path 與 extension 字典時，完整 extension 掃描使用新 path 字典，不另外跑舊 extension 的檔名重掃。舊版 `--only` 命令仍可使用；舊 path 字典已搬走而只想重跑 extension 時，可用 `--only extensions --extensions-wordlist ... --paths-wordlist ...` 指定現有 path 字典，而不重跑 path 階段。這個 override 記在 `run.json` 的 `wordlists.extension_names_wordlist`，原 path 掃描使用的字典仍記在 `wordlists.paths_wordlist`。新 run 的 `report.md` 合併舊結果和本輪結果；`report.md` 與 `summary.json` 引用的舊 raw evidence 會複製到新 run 的 `hosts/<hostname>-<hash>/reused/`，因此這些連結在單獨搬移新 run 後仍可使用。字典路徑仍指向使用者指定的檔案；要再重跑需要該字典仍存在，或重新指定字典。讀取正在執行中的 run 會因缺少 `run.json` 而停止。
 重跑的 exit code 依本輪指定階段判定；報表仍保留整個 host 的狀態，所以舊 DNS 階段 `unavailable` 可能讓 host 顯示 `partial`，即使新的 path 掃描完成。
 
+### 把新 hostname 加入下一輪
+
+如果 `hosts.txt` 同時有已掃過和新找到的 hostname，用 `--extend-run` 指向上一輪：
+
+```bash
+python3 scripts/web-recon.py --extend-run ./runs/example \
+  --hosts-file hosts.txt --out-dir ./runs/example-next
+```
+
+工具沿用來源 run 的 port、未指定的字典與掃描上限。新 hostname 做完整初查；舊 hostname 已完成的階段沿用，先前失敗的字典階段重試。達到相同 crawl／request 上限所造成的 Web `partial` 可沿用；response body 不完整則重試。解析、scheme、TLS 或 DNS 固定檢查未完成時，該 hostname 重新做完整初查。指定 `--public-sources` 時，舊 hostname 只補查尚未完成的公開資料來源。來源 run 裡即使有不在新 hosts file 的 hostname，仍保留在新報表，先前失敗的階段也會重試。新 run 的 `report.md` 在 `This run` 欄標示 `reused`、`updated`、`scanned` 或 `retry_failed`。重試失敗時，舊結果仍在報表，失敗嘗試另存並於下一輪再試；沿用結果引用的原始證據會複製進新 run，搬走來源 run 後連結仍可用。
+
+若字典檔路徑或內容改變，`--extend-run` 只替舊 hostname 更新對應的 prefix、path 或 extension 階段，新 hostname 使用目前的字典。例如在加入新 host 時換 path 字典：
+
+```bash
+python3 scripts/web-recon.py --extend-run ./runs/example \
+  --hosts-file hosts.txt --paths-wordlist /usr/share/seclists/Discovery/Web-Content/big.txt
+```
+
+完整新 run 會在 `run.json` 保存字典內容的 SHA-256，所以下一輪能辨識同一路徑的內容變更；`--extend-run` 也會保存本輪更新階段的 hash。舊版 run 沒有這個紀錄，沿用它的階段仍是未知 hash；若在原路徑改過字典，明確傳入該字典參數就會更新對應階段。沿用階段的字典檔即使已移走，仍可沿用結果；新 hostname 或需要更新的階段必須有對應字典檔。port 必須與來源 run 相同。`--extend-run` 需要來源 run 的 `run.json`，不能接正在執行中的 run。
+
+新 run 會保存每個 hostname 使用的 Web 與 extension request 上限。下一輪明確改 `--max-pages`、`--max-depth`、`--max-body-bytes` 或 `--max-requests` 時，受影響的舊 hostname 重新做 Web 初查；只改 `--max-extra-requests` 時更新 extension 階段。舊版 run 沒有上限紀錄，已完成的 Web 結果可沿用，Web `partial` 會重新初查。工具不會在沒有連線的情況下得知遠端網站內容是否改變；要重新讀取已完成的網站，可另開完整初查。
+
+根目錄的 `new-hosts.txt` 只列本輪結果中尚未作為輸入掃描的候選 hostname，可直接作下一輪的 `--hosts-file`；若使用自己累積的 hosts file，`--extend-run` 仍會排除已完成的 hostname。
+
 執行開始會印出輸出目錄。終端顯示各階段的開始、完成與耗時。`HTTP vhost scan 9,222/114,438 tried (8%), elapsed 7m43s` 表示 ffuf 在 HTTP vhost 階段已測 9,222 個字典項，共 114,438 個；8% 只代表這個階段的進度，7m43s 是已耗時間。`progress.jsonl` 同步保存事件與原始 stage 名稱，可在另一個 terminal 用 `tail -f <輸出目錄>/progress.jsonl` 查看。DNS 與 Web 檢查可同時進行。每個 origin 的 vhost、path、extension 掃描預設依序執行；加入 `--scanner-workers 2` 或 `3` 可同時跑最多 2 或 3 個 `ffuf` 階段。每個 `ffuf` 仍各以 20 requests/s 為上限，因此 2 個 worker 的合計上限是 40 requests/s。ffuf 每個工作的 timeout 至少為 1 小時；大型字典會依項數與 rate 延長，實際值記在對應的 `*.status.json`。`--hosts-file` 的 hostname 仍逐一處理。
 
 `--public-sources` 才查 crt.sh 與 Wayback CDX；候選 hostname 不會在同一輪自動探測。`.htb` 等內部名稱不送到公共資料來源。當前服務的 TLS certificate SAN 始終檢查。來源、上限與輸出見 [公開資料來源](docs/public-sources.md)。

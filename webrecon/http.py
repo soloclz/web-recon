@@ -368,6 +368,7 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
     fixed: list[dict] = []
     diagnostics: list[str] = []
     partial = False
+    partial_reasons: set[str] = set()
     try:
         baselines = [client.fetch(origin + "/web-recon-missing-" + uuid.uuid4().hex, "missing-control")
                      for _ in range(2)]
@@ -375,6 +376,11 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
         return {"status": "error", "diagnostics": [str(exc)], "found_hosts": [],
                 "candidate_urls": [], "fixed": [], "pages": [], "scripts": [], "source_maps": []}
     baseline_public = [x.public() for x in baselines]
+    for response in baselines:
+        if response.exit_code or response.truncated:
+            partial = True
+            partial_reasons.add("incomplete_body")
+            candidate_urls.append({"url": response.url, "source": "incomplete_body"})
     fetched_fixed: dict[str, Response] = {}
     sitemap_queue: deque[tuple[str, int]] = deque()
     for path in FIXED_PATHS:
@@ -384,12 +390,15 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
         except BudgetExceeded as exc:
             diagnostics.append(str(exc))
             partial = True
+            partial_reasons.add("request_limit")
             candidate_urls.append({"url": url, "source": "request_limit"})
             continue
         result = {**response.public(), **compare_baseline(response, baselines)}
         fixed.append(result)
-        if response.truncated:
-            candidate_urls.append({"url": url, "source": "body_limit"})
+        if response.exit_code or response.truncated:
+            partial = True
+            partial_reasons.add("incomplete_body")
+            candidate_urls.append({"url": url, "source": "incomplete_body"})
         fetched_fixed[url] = response
         if path.startswith("/sitemap") and result["assessment"] == "candidate":
             sitemap_queue.append((url, 0))
@@ -414,8 +423,13 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
             except BudgetExceeded as exc:
                 diagnostics.append(str(exc))
                 partial = True
+                partial_reasons.add("request_limit")
                 candidate_urls.append({"url": url, "source": "request_limit"})
                 continue
+        if response.exit_code or response.truncated:
+            partial = True
+            partial_reasons.add("incomplete_body")
+            candidate_urls.append({"url": url, "source": "incomplete_body"})
         assessment = compare_baseline(response, baselines)
         locs, is_index = _sitemap_locs(response.body, url) if assessment["assessment"] == "candidate" else ([], False)
         sitemap_results.append({"url": url, "assessment": assessment, "is_index": is_index,
@@ -439,10 +453,12 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
         except BudgetExceeded as exc:
             diagnostics.append(str(exc))
             partial = True
+            partial_reasons.add("request_limit")
             candidate_urls.append({"url": url, "source": "request_limit"})
             continue
         if response.exit_code or response.truncated:
             partial = True
+            partial_reasons.add("incomplete_body")
             candidate_urls.append({"url": url, "source": "incomplete_body"})
             continue
         page = {"url": url, "depth": depth, **response.public()}
@@ -485,6 +501,7 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
                     _map_urls(origin, target, "html_comment", found_hosts, candidate_urls)
     if page_queue:
         partial = True
+        partial_reasons.add("crawl_limit")
     for pending_url, _, _ in page_queue:
         candidate_urls.append({"url": pending_url, "source": "crawl_limit"})
     for script_url in sorted(seen_scripts)[:20]:
@@ -493,10 +510,14 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
         except BudgetExceeded as exc:
             diagnostics.append(str(exc))
             partial = True
+            partial_reasons.add("request_limit")
             candidate_urls.append({"url": script_url, "source": "request_limit"})
             continue
         scripts.append(response.public())
         if response.exit_code or response.truncated:
+            partial = True
+            partial_reasons.add("incomplete_body")
+            candidate_urls.append({"url": script_url, "source": "incomplete_body"})
             continue
         body_text = response.body.decode("utf-8", "replace")
         matches = re.findall(r"(?:\/\/[@#]\s*sourceMappingURL=|\/\*#\s*sourceMappingURL=)([^\s*]+)", body_text)
@@ -512,8 +533,13 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
             except BudgetExceeded as exc:
                 diagnostics.append(str(exc))
                 partial = True
+                partial_reasons.add("request_limit")
                 continue
             result = {**map_response.public(), **compare_baseline(map_response, baselines)}
+            if map_response.exit_code or map_response.truncated:
+                partial = True
+                partial_reasons.add("incomplete_body")
+                candidate_urls.append({"url": map_url, "source": "incomplete_body"})
             if result["assessment"] == "candidate":
                 try:
                     map_data = json.loads(map_response.body)
@@ -523,9 +549,14 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
             source_maps.append(result)
     if len(seen_scripts) > 20 or sitemap_queue:
         partial = True
+    if len(seen_scripts) > 20:
+        partial_reasons.add("script_limit")
+    if sitemap_queue:
+        partial_reasons.add("sitemap_limit")
     for script_url in sorted(seen_scripts)[20:]:
         candidate_urls.append({"url": script_url, "source": "script_limit"})
     return {"status": "partial" if partial else "completed", "origin": origin, "baseline": baseline_public,
+            "partial_reasons": sorted(partial_reasons),
             "fixed": fixed, "sitemaps": sitemap_results, "pages": pages,
             "scripts": scripts, "source_maps": source_maps, "found_hosts": found_hosts,
             "candidate_urls": candidate_urls, "diagnostics": diagnostics,

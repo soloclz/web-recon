@@ -20,6 +20,13 @@ from .public import run_public_sources
 from .progress import ProgressReporter
 
 _HOST_RE = re.compile(r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+WEB_LIMIT_NAMES = ("max_pages", "max_depth", "max_body_bytes", "max_requests")
+
+
+def scan_settings(options: argparse.Namespace) -> dict:
+    return {"web": {name: getattr(options, name) for name in WEB_LIMIT_NAMES},
+            "max_extra_requests": options.max_extra_requests,
+            "public_sources": options.public_sources}
 
 
 def normalize_host(value: str) -> str:
@@ -91,7 +98,7 @@ def _relative_artifacts(value, run_dir: Path, key: str = ""):
     if isinstance(value, dict):
         return {name: _relative_artifacts(item, run_dir, name)
                 for name, item in value.items()}
-    if isinstance(value, str) and key in ("prefix", "artifact", "stdout", "stderr", "meta"):
+    if isinstance(value, str) and key in ("prefix", "artifact", "stdout", "stderr", "meta", "summary"):
         return _artifact_path(value, run_dir)
     return value
 
@@ -152,6 +159,7 @@ def run_host(host: str, port: int, run_dir: Path, options: argparse.Namespace,
     host_dir = run_dir / "hosts" / f"{host[:80]}-{slug}"
     host_dir.mkdir(parents=True, exist_ok=False)
     result: dict = {"host": host, "port": port, "status": "error", "resolved_ips": [],
+                    "scan_settings": scan_settings(options),
                     "stages": {}, "web": {}, "scanners": {}, "new_hosts": []}
     if progress is not None:
         progress.start(host, "resolution")
@@ -189,7 +197,8 @@ def run_host(host: str, port: int, run_dir: Path, options: argparse.Namespace,
                 ("paths", run_paths, (origin, options.paths_wordlist,
                                       scanner_dir / "paths")),
                 ("extensions", run_extensions,
-                 (origin, options.paths_wordlist, options.extensions_wordlist,
+                 (origin, getattr(options, "extension_names_wordlist", None) or options.paths_wordlist,
+                  options.extensions_wordlist,
                   _observed_basenames(web), scanner_dir / "extensions",
                   options.max_extra_requests)),
             ]
@@ -251,16 +260,41 @@ def create_run_dir(path: Path | None) -> Path:
     raise RuntimeError("could not allocate a run directory")
 
 
+def hash_wordlists(wordlists: dict[str, str | None]) -> dict[str, str | None]:
+    """Save a content fingerprint so later runs can notice an in-place edit."""
+    hashes = {}
+    for name, value in wordlists.items():
+        if not value:
+            hashes[name] = None
+            continue
+        digest = hashlib.sha256()
+        try:
+            with Path(value).open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            hashes[name] = None
+        else:
+            hashes[name] = digest.hexdigest()
+    return hashes
+
+
 def write_run_outputs(run_dir: Path, results: list[dict], port: int,
                       wordlists: dict[str, str | None], *,
+                      wordlist_hashes: dict[str, str | None] | None = None,
+                      settings: dict | None = None,
                       source_run: Path | None = None,
+                      extended_from: Path | None = None,
                       rerun_stages: tuple[str, ...] = ()) -> None:
     """Write the batch overview and one readable report after every host finishes."""
     from .report import write_report
 
     new_hosts: dict[str, dict] = {}
+    processed_hosts = {result["host"] for result in results}
     for result in results:
         for entry in result.get("new_hosts", []):
+            if entry["name"] in processed_hosts:
+                continue
             item = new_hosts.setdefault(entry["name"], {"name": entry["name"], "observations": []})
             item["observations"].append({"input_host": result["host"], "sources": entry["sources"],
                                          "source_ip_port": entry["source_ip_port"]})
@@ -268,14 +302,20 @@ def write_run_outputs(run_dir: Path, results: list[dict], port: int,
     (run_dir / "new-hosts.jsonl").write_text("".join(json.dumps(new_hosts[name], ensure_ascii=False) + "\n"
                                                   for name in sorted(new_hosts)), encoding="utf-8")
     overview = {"created_at": datetime.now().isoformat(), "port": port, "wordlists": wordlists,
+                "wordlist_hashes": wordlist_hashes if wordlist_hashes is not None else hash_wordlists(wordlists),
                 "hosts": [{"host": item["host"], "status": item["status"],
+                           "action": item.get("action", "scanned"),
                            "resolved_ips": item["resolved_ips"],
                            "new_host_count": len(item.get("new_hosts", []))} for item in results]}
+    if settings is not None:
+        overview["scan_settings"] = settings
     if source_run is not None:
         overview["source_run"] = str(source_run)
         overview["rerun_stages"] = list(rerun_stages)
         if len(rerun_stages) == 1:
             overview["only"] = rerun_stages[0]
+    if extended_from is not None:
+        overview["extended_from"] = str(extended_from)
     (run_dir / "run.json").write_text(json.dumps(overview, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     write_report(run_dir, results)
 
@@ -286,7 +326,11 @@ def parser() -> argparse.ArgumentParser:
     group.add_argument("--host", help="one hostname")
     group.add_argument("--hosts-file", type=Path, help="one hostname per line")
     ap.add_argument("--port", type=int)
-    ap.add_argument("--from-run", type=Path, help="reuse a completed run and rerun stages selected by wordlist flags")
+    source_group = ap.add_mutually_exclusive_group()
+    source_group.add_argument("--from-run", type=Path,
+                              help="reuse a completed run and rerun stages selected by wordlist flags")
+    source_group.add_argument("--extend-run", type=Path,
+                              help="add hostnames to a completed run without rescanning finished hosts")
     ap.add_argument("--only", choices=("prefixes", "paths", "extensions"),
                     help="optional explicit single stage for legacy reruns")
     ap.add_argument("--host-prefixes-wordlist", type=Path)
@@ -306,8 +350,14 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     ap = parser()
-    args = ap.parse_args(argv)
-    if args.from_run is None and ((args.host is None and args.hosts_file is None) or args.port is None):
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    args = ap.parse_args(raw_argv)
+    args.explicit_limits = {name for name in (*WEB_LIMIT_NAMES, "max_extra_requests")
+                            if any(arg == "--" + name.replace("_", "-") or
+                                   arg.startswith("--" + name.replace("_", "-") + "=")
+                                   for arg in raw_argv)}
+    if args.from_run is None and args.extend_run is None and (
+            (args.host is None and args.hosts_file is None) or args.port is None):
         ap.error("fresh runs require --host or --hosts-file and --port")
     if args.from_run is not None:
         if args.hosts_file is not None:
@@ -338,6 +388,8 @@ def main(argv: list[str] | None = None) -> int:
             ap.error("--public-sources is not a wordlist rerun stage")
     elif args.only is not None:
         ap.error("--only requires --from-run")
+    if args.extend_run is not None and args.host is None and args.hosts_file is None:
+        ap.error("--extend-run requires --host or --hosts-file")
     if args.port is not None and not 1 <= args.port <= 65535:
         ap.error("--port must be between 1 and 65535")
     if args.max_pages < 1 or args.max_depth < 0 or args.max_body_bytes < 1024 or args.max_requests < 4 or args.max_extra_requests < 0:
@@ -354,8 +406,17 @@ def main(argv: list[str] | None = None) -> int:
             return rerun_main(args)
         except (OSError, ValueError, RuntimeError) as exc:
             ap.error(str(exc))
+    if args.extend_run is not None:
+        from .extend import extend_main
+        try:
+            return extend_main(args)
+        except (OSError, ValueError, RuntimeError) as exc:
+            ap.error(str(exc))
     try:
         hosts = read_hosts(args.host, args.hosts_file)
+        wordlists = {name: str(getattr(args, name).resolve()) if getattr(args, name) else None
+                     for name in ("host_prefixes_wordlist", "paths_wordlist", "extensions_wordlist")}
+        wordlist_hashes = hash_wordlists(wordlists)
         run_dir = create_run_dir(args.out_dir)
     except (OSError, ValueError, RuntimeError) as exc:
         ap.error(str(exc))
@@ -365,9 +426,8 @@ def main(argv: list[str] | None = None) -> int:
         for host in hosts:
             print(f"[{host}:{args.port}]", flush=True)
             results.append(run_host(host, args.port, run_dir, args, progress))
-    wordlists = {name: str(getattr(args, name).resolve()) if getattr(args, name) else None
-                 for name in ("host_prefixes_wordlist", "paths_wordlist", "extensions_wordlist")}
-    write_run_outputs(run_dir, results, args.port, wordlists)
+    write_run_outputs(run_dir, results, args.port, wordlists, wordlist_hashes=wordlist_hashes,
+                      settings=scan_settings(args))
     print(f"Report: {run_dir / 'report.md'}", flush=True)
     print(run_dir)
     return 0 if all(item["status"] == "completed" for item in results) else 1

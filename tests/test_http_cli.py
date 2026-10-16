@@ -112,6 +112,7 @@ class HttpCliTests(unittest.TestCase):
         client = FakeClient(reply)
         result = http.inspect_origin(origin, root, client, max_pages=1, max_depth=2)
         self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["partial_reasons"], ["crawl_limit"])
         self.assertEqual([item["url"] for item in result["pages"]], [origin + "/"])
         self.assertTrue({origin + "/a", origin + "/b"}.issubset({
             item["url"] for item in result["candidate_urls"] if item["source"] == "crawl_limit"
@@ -288,6 +289,34 @@ class HttpCliTests(unittest.TestCase):
         self.assertEqual(result["status"], "partial")
         self.assertIn({"url": origin + "/broken", "source": "incomplete_body"},
                       result["candidate_urls"])
+
+    def test_incomplete_script_is_distinct_from_crawl_limit(self):
+        origin = "http://box.htb:8080"
+        root = make_response(origin + "/", body=(
+            b'<html><a href="/next">Next</a><script src="/broken.js"></script></html>'))
+
+        def reply(url, _label):
+            if urlsplit(url).path == "/broken.js":
+                return make_response(url, body=b"partial", content_type="application/javascript",
+                                     exit_code=63)
+            return make_response(url, status=404, body=b"missing", content_type="text/plain")
+
+        result = http.inspect_origin(origin, root, FakeClient(reply), max_pages=1)
+        self.assertEqual(result["partial_reasons"], ["crawl_limit", "incomplete_body"])
+        self.assertIn({"url": origin + "/broken.js", "source": "incomplete_body"},
+                      result["candidate_urls"])
+
+    def test_incomplete_missing_path_baseline_marks_web_partial(self):
+        origin = "http://box.htb:8080"
+        root = make_response(origin + "/", body=b"<html>Home</html>")
+
+        def reply(url, _label):
+            return make_response(url, status=404, body=b"partial", exit_code=(
+                63 if "web-recon-missing" in url else 0))
+
+        result = http.inspect_origin(origin, root, FakeClient(reply))
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["partial_reasons"], ["incomplete_body"])
 
     def test_new_host_endpoint_uses_actual_connected_ip(self):
         result = {"stages": {"scheme": {"probes": {"http": {"usable": True,

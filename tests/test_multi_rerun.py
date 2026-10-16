@@ -177,6 +177,26 @@ class MultiRerunTests(unittest.TestCase):
             self.source_result["scanners"]["http"]["vhost"],
         )
 
+    def test_rerun_keeps_hash_of_unchanged_stage(self):
+        prefixes = self._wordlist("old-prefixes.txt")
+        source_index = self.source / "run.json"
+        overview = json.loads(source_index.read_text())
+        overview["wordlists"]["host_prefixes_wordlist"] = str(prefixes)
+        overview["wordlist_hashes"] = cli.hash_wordlists(overview["wordlists"])
+        old_hash = overview["wordlist_hashes"]["host_prefixes_wordlist"]
+        source_index.write_text(json.dumps(overview))
+        prefixes.write_text("changed without a prefix rerun\n")
+        paths = self._wordlist("replacement-paths.txt")
+
+        with patch.object(rerun, "run_paths", return_value=self._path_result()), \
+             patch.object(rerun, "run_extension_filenames", return_value=self._extension_result()):
+            code, output, _ = self._run("hash-preservation", "--paths-wordlist", str(paths))
+
+        self.assertEqual(code, 0)
+        saved = json.loads((output / "run.json").read_text())
+        self.assertEqual(saved["wordlist_hashes"]["host_prefixes_wordlist"], old_hash)
+        self.assertNotEqual(old_hash, cli.hash_wordlists({"prefix": str(prefixes)})["prefix"])
+
     def test_one_extension_flag_infers_extension_stage(self):
         extensions = self._wordlist("extensions.txt")
         with (

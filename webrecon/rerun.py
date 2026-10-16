@@ -10,13 +10,14 @@ from copy import deepcopy
 from pathlib import Path
 
 from .cli import (_add_candidates, _observed_basenames, _relative_artifacts,
+                  hash_wordlists,
                   _run_stage, create_run_dir, normalize_host, write_run_outputs)
 from .dns import rerun_dns_words
 from .fuzz import run_extension_filenames, run_extensions, run_paths, run_vhost
 from .progress import ProgressReporter
 
 
-_EVIDENCE_KEYS = {"prefix", "artifact", "stdout", "stderr", "meta"}
+_EVIDENCE_KEYS = {"prefix", "artifact", "stdout", "stderr", "meta", "summary"}
 
 
 def _host_dir(run_dir: Path, host: str) -> Path:
@@ -289,7 +290,7 @@ def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
     else:
         stage_statuses: list[str] = []
         web_origins = 0
-        if "prefixes" in stages:
+        if "prefixes" in stages and getattr(options, "rerun_dns_words", True):
             previous_dns = result.get("dns", {})
             updated_dns = _run_stage(progress, host, "dns-words", rerun_dns_words,
                                      previous_dns, host, options.host_prefixes_wordlist,
@@ -306,7 +307,10 @@ def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
                     ["Gobuster rerun failed", *failure_diagnostics])
             result["dns"] = updated_dns
             result.setdefault("stages", {})["dns"] = {"status": result["dns"].get("status", "error")}
-            stage_statuses.append(result["dns"].get("scanner", {}).get("status", "error"))
+            dns_word_status = result["dns"].get("scanner", {}).get("status", "error")
+            stage_statuses.append("completed" if (result["dns"].get("status") == "unavailable"
+                                                  and dns_word_status == "unavailable")
+                                  else dns_word_status)
         for label, web in result.get("web", {}).items():
             if label not in ("http", "https") or not isinstance(web, dict):
                 continue
@@ -322,7 +326,7 @@ def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
                 return _run_stage(progress, host, stage, func, *args, progress=callback)
 
             jobs = []
-            if "prefixes" in stages:
+            if "prefixes" in stages and getattr(options, "rerun_vhost", True):
                 jobs.append(("vhost", run_vhost, (origin, host,
                             options.host_prefixes_wordlist, scan_dir / "vhost")))
             if "paths" in stages:
@@ -336,7 +340,7 @@ def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
                                      (origin, options.paths_wordlist, confirmed,
                                       scan_dir / "extension-filenames", options.max_extra_requests)))
             if "extensions" in stages:
-                paths = (options.paths_wordlist or
+                paths = (getattr(options, "extension_names_wordlist", None) or options.paths_wordlist or
                          _previous_paths_wordlist(source_run, overview, result, label))
                 jobs.append(("extensions", run_extensions,
                              (origin, paths, options.extensions_wordlist,
@@ -359,6 +363,17 @@ def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
                 else:
                     scanner[name] = stage
                 stage_statuses.append(stage.get("status", "error"))
+        if "public" in stages:
+            from .public import run_public_sources
+            public = _run_stage(progress, host, "public", run_public_sources,
+                                host, host_dir / "public")
+            result["public_sources"] = public
+            stage_statuses.append("completed" if public.get("status") == "unavailable"
+                                  else public.get("status", "error"))
+        if "paths" in stages or "extensions" in stages:
+            result.setdefault("scan_settings", {})["max_extra_requests"] = options.max_extra_requests
+        if "public" in stages:
+            result.setdefault("scan_settings", {})["public_sources"] = True
         rerun_status = ("unavailable" if web_origins == 0 else
                         "completed" if all(status in ("completed", "not_run")
                                            for status in stage_statuses) else "partial")
@@ -389,15 +404,6 @@ def rerun_main(options) -> int:
             for label in result.get("web", {}):
                 if label in ("http", "https") and options.paths_wordlist is None:
                     _previous_paths_wordlist(source_run, overview, result, label)
-    run_dir = create_run_dir(options.out_dir)
-    source_roots = _source_roots(source_run)
-    print(f"Output: {run_dir}", flush=True)
-    results = []
-    with ProgressReporter(run_dir) as progress:
-        for result in summaries:
-            print(f"[{result['host']}:{result['port']}] rerun {', '.join(options.rerun_stages)}", flush=True)
-            results.append(_run_one(result, source_run, run_dir, overview, options, progress,
-                                    source_roots))
     wordlists = dict(overview.get("wordlists") or {})
     for name in ("host_prefixes_wordlist", "paths_wordlist", "extensions_wordlist"):
         path = getattr(options, name)
@@ -408,7 +414,33 @@ def rerun_main(options) -> int:
                 wordlists["extension_names_wordlist"] = str(path.resolve())
             else:
                 wordlists[name] = str(path.resolve())
+    current_hashes = hash_wordlists(wordlists)
+    previous_hashes = overview.get("wordlist_hashes") or {}
+    wordlist_hashes = {name: previous_hashes.get(name) for name in wordlists}
+    for name, stage in (("host_prefixes_wordlist", "prefixes"),
+                        ("paths_wordlist", "paths"),
+                        ("extensions_wordlist", "extensions")):
+        if stage in options.rerun_stages and getattr(options, name) is not None:
+            wordlist_hashes[name] = current_hashes[name]
+    if options.paths_wordlist is not None:
+        wordlist_hashes["extension_names_wordlist"] = current_hashes.get("extension_names_wordlist")
+    run_dir = create_run_dir(options.out_dir)
+    source_roots = _source_roots(source_run)
+    print(f"Output: {run_dir}", flush=True)
+    results = []
+    with ProgressReporter(run_dir) as progress:
+        for result in summaries:
+            print(f"[{result['host']}:{result['port']}] rerun {', '.join(options.rerun_stages)}", flush=True)
+            results.append(_run_one(result, source_run, run_dir, overview, options, progress,
+                                    source_roots))
+    settings = overview.get("scan_settings")
+    if isinstance(settings, dict):
+        settings = deepcopy(settings)
+        if "paths" in options.rerun_stages or "extensions" in options.rerun_stages:
+            settings["max_extra_requests"] = options.max_extra_requests
     write_run_outputs(run_dir, results, overview["port"], wordlists,
+                      wordlist_hashes=wordlist_hashes,
+                      settings=settings,
                       source_run=source_run, rerun_stages=options.rerun_stages)
     print(f"Report: {run_dir / 'report.md'}", flush=True)
     print(run_dir)

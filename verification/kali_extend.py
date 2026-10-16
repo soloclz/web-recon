@@ -1,0 +1,66 @@
+"""Check cumulative host scans and selective wordlist updates on Kali."""
+
+from __future__ import annotations
+
+import json
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from tempfile import mkdtemp
+from threading import Thread
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from webrecon.cli import main
+
+
+class Site(BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+
+    def do_GET(self):
+        route = self.path.split("?", 1)[0]
+        body = b"<html><title>Fixture</title></html>" if route == "/" else (
+            b"FOUND" if route in {"/one", "/two"} else b"missing")
+        status = 200 if route in {"/", "/one", "/two"} else 404
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+root = Path(mkdtemp(prefix="web-recon-extend-"))
+paths = root / "paths.txt"
+paths.write_text("one\n")
+hosts = root / "hosts.txt"
+hosts.write_text("localhost\n127.0.0.1\n")
+server = ThreadingHTTPServer(("127.0.0.1", 0), Site)
+Thread(target=server.serve_forever, daemon=True).start()
+try:
+    first = root / "first"
+    main(["--host", "localhost", "--port", str(server.server_port),
+          "--paths-wordlist", str(paths), "--out-dir", str(first)])
+    second = root / "second"
+    main(["--extend-run", str(first), "--hosts-file", str(hosts),
+          "--out-dir", str(second)])
+    actions = {item["host"]: item["action"] for item in json.loads(
+        (second / "run.json").read_text())["hosts"]}
+    assert actions == {"localhost": "reused", "127.0.0.1": "scanned"}, actions
+
+    paths.write_text("two\n")
+    third = root / "third"
+    main(["--extend-run", str(second), "--hosts-file", str(hosts),
+          "--out-dir", str(third)])
+    actions = {item["host"]: item["action"] for item in json.loads(
+        (third / "run.json").read_text())["hosts"]}
+    assert actions == {"localhost": "updated", "127.0.0.1": "updated"}, actions
+    for summary_path in third.glob("hosts/*/summary.json"):
+        summary = json.loads(summary_path.read_text())
+        assert summary["rerun"]["stages"] == ["paths"], summary_path
+        assert summary["scanners"]["http"]["paths"]["status"] == "completed", summary_path
+        assert not (summary_path.parent / "responses").exists(), summary_path
+    assert (third / "report.md").is_file()
+    print(json.dumps({"directory": str(root), "second_actions": {
+        "localhost": "reused", "127.0.0.1": "scanned"}, "third_actions": actions}, indent=2))
+finally:
+    server.shutdown()

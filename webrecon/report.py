@@ -211,8 +211,10 @@ def write_report(run_dir: Path, results: list[dict], source_run: Path | None = N
     lines = ["# Web recon report", "",
              "Candidates below differ from missing-path or default-vhost controls, or came from named sources. Review the linked evidence before using them.", "",
              "## Hosts", ""]
+    if any(result.get("extended_from") for result in results):
+        lines[2:2] = ["Earlier hostname results and their referenced evidence are included in this run. The `This run` column shows which hosts were scanned or updated.", ""]
     rerun = next((result for result in results if result.get("reused_from")), None)
-    if rerun:
+    if rerun and not any(result.get("extended_from") for result in results):
         stages = rerun.get("rerun_stages") or ([rerun["rerun_only"]] if rerun.get("rerun_only") else [])
         lines[2:2] = [f"Rerun stages: **{_text(', '.join(stages))}**. "
                       f"Referenced reused evidence is included in this run. Source: {_text(rerun['reused_from'])}.", ""]
@@ -223,10 +225,11 @@ def write_report(run_dir: Path, results: list[dict], source_run: Path | None = N
         origins = ", ".join(_text(web.get("origin", scheme))
                             for scheme, web in (result.get("web", {}) or {}).items()) or "—"
         overview.append((_text(result.get("host", "")), _text(result.get("port", "")),
-                         _text(result.get("status", "")), origins,
+                         _text(result.get("status", "")),
+                         _text(result.get("action", "scanned")), origins,
                          str(len(result.get("new_hosts", []) or [])), summary))
     run_index = _link(run_dir, "run.json", "run.json", run_dir)
-    _table(lines, ("Host", "Port", "Status", "Origins", "New hosts", "Details"), overview,
+    _table(lines, ("Host", "Port", "Status", "This run", "Origins", "New hosts", "Details"), overview,
            total=len(overview), summary=run_index)
 
     for result in results:
@@ -238,6 +241,15 @@ def write_report(run_dir: Path, results: list[dict], source_run: Path | None = N
         lines += [f"## {host}:{port}", "", f"Status: **{_text(result.get('status', 'unknown'))}**. "
                   f"Resolved IPs: {_text(', '.join(result.get('resolved_ips', []) or []) or 'none')}. "
                   f"{requests_label}: {_text(result.get('request_count', 0))}. Full data: {summary}.", ""]
+        if result.get("action") == "reused":
+            lines += ["Reused from an earlier run; this run made no new requests to this hostname.", ""]
+        elif result.get("action") == "updated":
+            lines += ["Selected stages were updated; other evidence was reused from an earlier run.", ""]
+        elif result.get("action") == "retry_failed":
+            retry = result.get("retry") or {}
+            attempt_link = _link(run_dir, retry.get("summary"), "retry summary", run_dir)
+            lines += [f"Retry status: **{_text(retry.get('status', 'unknown'))}**. "
+                      f"Earlier evidence is retained; this attempt: {attempt_link}.", ""]
         if result.get("rerun"):
             lines += [f"Rerun status: **{_text(result['rerun'].get('status', 'unknown'))}**.", ""]
         lines += ["### Stage status", ""]
