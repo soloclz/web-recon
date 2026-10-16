@@ -213,7 +213,8 @@ def write_report(run_dir: Path, results: list[dict], source_run: Path | None = N
              "## Hosts", ""]
     rerun = next((result for result in results if result.get("reused_from")), None)
     if rerun:
-        lines[2:2] = [f"Rerun stage: **{_text(rerun.get('rerun_only', ''))}**. "
+        stages = rerun.get("rerun_stages") or ([rerun["rerun_only"]] if rerun.get("rerun_only") else [])
+        lines[2:2] = [f"Rerun stages: **{_text(', '.join(stages))}**. "
                       f"Unchanged stages reuse the saved results in {_text(rerun['reused_from'])}.", ""]
     overview = []
     for result in results:
@@ -233,11 +234,12 @@ def write_report(run_dir: Path, results: list[dict], source_run: Path | None = N
         host = _text(result.get("host", ""))
         port = _text(result.get("port", ""))
         summary = _link(run_dir, _summary_path(result), "summary.json", source_root)
+        requests_label = "Reused Web crawl requests" if result.get("reused_from") else "Saved Web requests"
         lines += [f"## {host}:{port}", "", f"Status: **{_text(result.get('status', 'unknown'))}**. "
                   f"Resolved IPs: {_text(', '.join(result.get('resolved_ips', []) or []) or 'none')}. "
-                  f"Saved Web requests: {_text(result.get('request_count', 0))}. Full data: {summary}.", ""]
+                  f"{requests_label}: {_text(result.get('request_count', 0))}. Full data: {summary}.", ""]
         if result.get("rerun"):
-            lines += [f"Selected rerun stage: **{_text(result['rerun'].get('status', 'unknown'))}**.", ""]
+            lines += [f"Rerun status: **{_text(result['rerun'].get('status', 'unknown'))}**.", ""]
         lines += ["### Stage status", ""]
         rows = []
         for name, stage in _stage_rows(result):

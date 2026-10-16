@@ -1,9 +1,10 @@
-"""Reuse a completed run while scanning only the selected wordlist stage."""
+"""Reuse a completed run while scanning stages selected by new wordlists."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from pathlib import Path
 
@@ -67,11 +68,16 @@ def _read_source(source_run: Path) -> tuple[dict, list[dict]]:
 
 def _previous_paths_wordlist(source_run: Path, overview: dict, result: dict,
                              label: str) -> Path | None:
-    value = (overview.get("wordlists") or {}).get("paths_wordlist")
-    if value:
-        path = Path(value)
-        if path.is_file():
-            return path
+    wordlists = overview.get("wordlists") or {}
+    for name in ("extension_names_wordlist", "paths_wordlist"):
+        value = wordlists.get(name)
+        if value:
+            path = Path(value)
+            if path.is_file():
+                return path
+            if name == "extension_names_wordlist":
+                raise ValueError("previous extension filename wordlist is unavailable; "
+                                 "pass --paths-wordlist with --only extensions")
     source = _host_dir(source_run, result["host"]) / "scanners" / label / "paths" / "paths.status.json"
     previous = result.get("scanners", {}).get(label, {}).get("paths", {})
     status_files = [source]
@@ -146,13 +152,19 @@ def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
     host_dir = _host_dir(run_dir, host)
     host_dir.mkdir(parents=True, exist_ok=False)
     result["reused_from"] = str(source_run)
-    result["rerun_only"] = options.only
+    stages = options.rerun_stages
+    result["rerun_stages"] = list(stages)
+    if len(stages) == 1:
+        result["rerun_only"] = stages[0]
+    else:
+        result.pop("rerun_only", None)
     if result.get("stages", {}).get("resolution", {}).get("status") != "completed":
-        result["rerun"] = {"status": "unavailable", "diagnostics": ["source host did not resolve"]}
+        result["rerun"] = {"status": "unavailable", "stages": list(stages),
+                           "diagnostics": ["source host did not resolve"]}
     else:
         stage_statuses: list[str] = []
         web_origins = 0
-        if options.only == "prefixes":
+        if "prefixes" in stages:
             previous_dns = result.get("dns", {})
             updated_dns = _run_stage(progress, host, "dns-words", rerun_dns_words,
                                      previous_dns, host, options.host_prefixes_wordlist,
@@ -184,34 +196,50 @@ def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
                     host, stage, scan_name, current, total)
                 return _run_stage(progress, host, stage, func, *args, progress=callback)
 
-            if options.only == "prefixes":
-                scanner["vhost"] = scan("vhost", run_vhost, origin, host,
-                                        options.host_prefixes_wordlist, scan_dir / "vhost")
-                stage_statuses.append(scanner["vhost"].get("status", "error"))
-            elif options.only == "paths":
-                scanner["paths"] = scan("paths", run_paths, origin,
-                                        options.paths_wordlist, scan_dir / "paths")
-                stage_statuses.append(scanner["paths"].get("status", "error"))
-                previous_ext = scanner.get("extensions", {})
-                confirmed = previous_ext.get("confirmed_extensions", [])
-                if confirmed:
-                    filenames = scan("extension-filenames", run_extension_filenames,
-                                     origin, options.paths_wordlist, confirmed,
-                                     scan_dir / "extension-filenames", options.max_extra_requests)
-                    scanner["extensions"] = _merge_filenames(previous_ext, filenames)
-                    stage_statuses.append(filenames.get("status", "error"))
-            elif options.only == "extensions":
+            jobs = []
+            if "prefixes" in stages:
+                jobs.append(("vhost", run_vhost, (origin, host,
+                            options.host_prefixes_wordlist, scan_dir / "vhost")))
+            if "paths" in stages:
+                jobs.append(("paths", run_paths, (origin,
+                            options.paths_wordlist, scan_dir / "paths")))
+                if "extensions" not in stages:
+                    previous_ext = scanner.get("extensions", {})
+                    confirmed = previous_ext.get("confirmed_extensions", [])
+                    if confirmed:
+                        jobs.append(("extension-filenames", run_extension_filenames,
+                                     (origin, options.paths_wordlist, confirmed,
+                                      scan_dir / "extension-filenames", options.max_extra_requests)))
+            if "extensions" in stages:
                 paths = (options.paths_wordlist or
                          _previous_paths_wordlist(source_run, overview, result, label))
-                scanner["extensions"] = scan(
-                    "extensions", run_extensions, origin, paths,
-                    options.extensions_wordlist, _observed_basenames(web),
-                    scan_dir / "extensions", options.max_extra_requests)
-                stage_statuses.append(scanner["extensions"].get("status", "error"))
+                jobs.append(("extensions", run_extensions,
+                             (origin, paths, options.extensions_wordlist,
+                              _observed_basenames(web), scan_dir / "extensions",
+                              options.max_extra_requests)))
+            scanner_results = {}
+            if options.scanner_workers == 1 or len(jobs) < 2:
+                for name, function, args in jobs:
+                    scanner_results[name] = scan(name, function, *args)
+            else:
+                with ThreadPoolExecutor(max_workers=options.scanner_workers) as pool:
+                    futures = {pool.submit(scan, name, function, *args): name
+                               for name, function, args in jobs}
+                    for future in as_completed(futures):
+                        scanner_results[futures[future]] = future.result()
+            for name, _, _ in jobs:
+                stage = scanner_results[name]
+                if name == "extension-filenames":
+                    scanner["extensions"] = _merge_filenames(previous_ext, stage)
+                else:
+                    scanner[name] = stage
+                stage_statuses.append(stage.get("status", "error"))
         rerun_status = ("unavailable" if web_origins == 0 else
                         "completed" if all(status in ("completed", "not_run")
                                            for status in stage_statuses) else "partial")
-        result["rerun"] = {"status": rerun_status, "stage": options.only}
+        result["rerun"] = {"status": rerun_status, "stages": list(stages)}
+        if len(stages) == 1:
+            result["rerun"]["stage"] = stages[0]
     result["new_hosts"] = _add_candidates(host, result, result.get("resolved_ips", []), port)
     result["status"] = _status(result)
     clean = _relative_artifacts(result, run_dir)
@@ -223,7 +251,14 @@ def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
 def rerun_main(options) -> int:
     source_run = options.from_run.resolve()
     overview, summaries = _read_source(source_run)
-    if options.only == "extensions":
+    if options.host is not None:
+        requested = normalize_host(options.host)
+        source_hosts = [result["host"] for result in summaries]
+        if source_hosts != [requested]:
+            raise ValueError(f"--host must match the sole source hostname: {', '.join(source_hosts)}")
+    if options.port is not None and options.port != overview["port"]:
+        raise ValueError(f"--port must match the source port: {overview['port']}")
+    if "extensions" in options.rerun_stages:
         for result in summaries:
             for label in result.get("web", {}):
                 if label in ("http", "https") and options.paths_wordlist is None:
@@ -233,15 +268,20 @@ def rerun_main(options) -> int:
     results = []
     with ProgressReporter(run_dir) as progress:
         for result in summaries:
-            print(f"[{result['host']}:{result['port']}] rerun {options.only}", flush=True)
+            print(f"[{result['host']}:{result['port']}] rerun {', '.join(options.rerun_stages)}", flush=True)
             results.append(_run_one(result, source_run, run_dir, overview, options, progress))
     wordlists = dict(overview.get("wordlists") or {})
     for name in ("host_prefixes_wordlist", "paths_wordlist", "extensions_wordlist"):
         path = getattr(options, name)
         if path is not None:
-            wordlists[name] = str(path.resolve())
+            if name == "paths_wordlist":
+                if "paths" in options.rerun_stages:
+                    wordlists[name] = str(path.resolve())
+                wordlists["extension_names_wordlist"] = str(path.resolve())
+            else:
+                wordlists[name] = str(path.resolve())
     write_run_outputs(run_dir, results, overview["port"], wordlists,
-                      source_run=source_run, only=options.only)
+                      source_run=source_run, rerun_stages=options.rerun_stages)
     print(f"Report: {run_dir / 'report.md'}", flush=True)
     print(run_dir)
     return 0 if all(item.get("rerun", {}).get("status") == "completed"

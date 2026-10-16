@@ -78,7 +78,7 @@ try:
         ("extensions", "--extensions-wordlist", extensions),
     ):
         out = root / f"rerun-{stage}"
-        code = main(["--from-run", str(cli_out), "--only", stage,
+        code = main(["--from-run", str(cli_out),
                      flag, str(wordlist), "--max-extra-requests", "2",
                      "--out-dir", str(out)])
         summary = json.loads(next(out.glob("hosts/*/summary.json")).read_text())
@@ -96,6 +96,21 @@ try:
             assert ".php" in summary["scanners"]["http"]["extensions"]["confirmed_extensions"]
         if stage == "prefixes":
             assert any(x["hostname"] == "admin.localhost" for x in summary["scanners"]["http"]["vhost"]["candidates"])
+    combined_out = root / "rerun-paths-extensions"
+    combined_code = main(["--from-run", str(cli_out),
+                          "--paths-wordlist", str(paths),
+                          "--extensions-wordlist", str(extensions),
+                          "--scanner-workers", "2", "--max-extra-requests", "2",
+                          "--out-dir", str(combined_out)])
+    combined_summary = json.loads(next(combined_out.glob("hosts/*/summary.json")).read_text())
+    assert combined_code == 0 and combined_summary["rerun"]["status"] == "completed"
+    assert combined_summary["rerun"]["stages"] == ["paths", "extensions"]
+    assert "filename_rescan" not in combined_summary["scanners"]["http"]["extensions"]
+    assert (combined_out / "report.md").is_file()
+    rerun_outputs["paths+extensions"] = {
+        "exit_code": combined_code, "status": combined_summary["status"],
+        "rerun_status": combined_summary["rerun"]["status"],
+        "report": str(combined_out / "report.md")}
     evidence = {
         "fixture_port": server.server_port,
         "vhost": {"status": vhost["status"], "candidates": vhost["candidates"],

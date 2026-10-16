@@ -21,23 +21,31 @@ python3 scripts/web-recon.py --hosts-file hosts.txt --port 443 \
 
 ### 只重跑換過的字典
 
-從**已完成**的 run 沿用解析、Web crawl 與其他 scanner 結果；另建一個輸出目錄，不修改原 run。例如只換 path 字典：
+從**已完成**的 run 沿用解析、Web crawl 與其他 scanner 結果；另建一個輸出目錄，不修改原 run。只傳要換的字典；傳兩份或三份就重跑對應的所有階段。例如只換 path 字典：
 
 ```bash
-python3 scripts/web-recon.py --from-run ./runs/example --only paths \
+python3 scripts/web-recon.py --from-run ./runs/example \
   --paths-wordlist /usr/share/seclists/Discovery/Web-Content/big.txt \
   --out-dir ./runs/example-paths-big
 ```
 
-`--from-run` 從原 run 的 `run.json` 讀 hostname 和 port，不再傳 `--host` 或 `--port`。三種重跑方式：
+同時換 path 與 extension 字典：
 
-| `--only` | 必填字典 | 本輪執行的階段 |
-| --- | --- | --- |
-| `prefixes` | `--host-prefixes-wordlist` | Gobuster DNS 字典與 ffuf vhost；沿用舊 DNS record、PTR、zone 與 AXFR 結果 |
-| `paths` | `--paths-wordlist` | ffuf path；如果舊 run 已確認 extension，也用新 path 字典重跑該 extension 的檔名掃描 |
-| `extensions` | `--extensions-wordlist` | 已觀察檔名的 extension 掃描；確認 extension 後，沿用舊 path 字典做檔名掃描 |
+```bash
+python3 scripts/web-recon.py --from-run ./runs/example \
+  --paths-wordlist /usr/share/seclists/Discovery/Web-Content/big.txt \
+  --extensions-wordlist /usr/share/seclists/Discovery/Web-Content/web-extensions.txt
+```
 
-重跑 extension 時，若舊 path 字典已搬走，可額外傳 `--paths-wordlist` 指定現有檔案。新 run 的 `report.md` 合併舊結果和本輪結果；舊 raw evidence 仍從原 run 連結，因此要保留原 run 目錄。讀取正在執行中的 run 會因缺少 `run.json` 而停止。
+`--from-run` 從原 run 的 `run.json` 讀 hostname 和 port。可以省略 `--host`、`--port`；若傳入，必須與單一 hostname 的原 run 相符。字典與執行階段的對應：
+
+| 字典參數 | 本輪執行的階段 |
+| --- | --- |
+| `--host-prefixes-wordlist` | Gobuster DNS 字典與 ffuf vhost；沿用舊 DNS record、PTR、zone 與 AXFR 結果 |
+| `--paths-wordlist` | ffuf path；如果舊 run 已確認 extension，也用新 path 字典重跑該 extension 的檔名掃描 |
+| `--extensions-wordlist` | 已觀察檔名的 extension 掃描；確認 extension 後，沿用舊 path 字典做檔名掃描 |
+
+同時傳 path 與 extension 字典時，完整 extension 掃描使用新 path 字典，不另外跑舊 extension 的檔名重掃。舊版 `--only` 命令仍可使用；舊 path 字典已搬走而只想重跑 extension 時，可用 `--only extensions --extensions-wordlist ... --paths-wordlist ...` 指定現有 path 字典，而不重跑 path 階段。這個 override 記在 `run.json` 的 `wordlists.extension_names_wordlist`，原 path 掃描使用的字典仍記在 `wordlists.paths_wordlist`。新 run 的 `report.md` 合併舊結果和本輪結果；舊 raw evidence 仍從原 run 連結，因此要保留原 run 目錄。讀取正在執行中的 run 會因缺少 `run.json` 而停止。
 重跑的 exit code 依本輪指定階段判定；報表仍保留整個 host 的狀態，所以舊 DNS 階段 `unavailable` 可能讓 host 顯示 `partial`，即使新的 path 掃描完成。
 
 執行開始會印出輸出目錄。終端顯示各階段的開始、完成、耗時，以及 `ffuf` 當次掃描的 `已測數/總數`；`progress.jsonl` 同步保存這些事件，可在另一個 terminal 用 `tail -f <輸出目錄>/progress.jsonl` 查看。DNS 與 Web 檢查可同時進行。每個 origin 的 vhost、path、extension 掃描預設依序執行；加入 `--scanner-workers 2` 或 `3` 可同時跑最多 2 或 3 個 `ffuf` 階段。每個 `ffuf` 仍各以 20 requests/s 為上限，因此 2 個 worker 的合計上限是 40 requests/s。`--hosts-file` 的 hostname 仍逐一處理。

@@ -249,7 +249,8 @@ def create_run_dir(path: Path | None) -> Path:
 
 def write_run_outputs(run_dir: Path, results: list[dict], port: int,
                       wordlists: dict[str, str | None], *,
-                      source_run: Path | None = None, only: str | None = None) -> None:
+                      source_run: Path | None = None,
+                      rerun_stages: tuple[str, ...] = ()) -> None:
     """Write the batch overview and one readable report after every host finishes."""
     from .report import write_report
 
@@ -268,7 +269,9 @@ def write_run_outputs(run_dir: Path, results: list[dict], port: int,
                            "new_host_count": len(item.get("new_hosts", []))} for item in results]}
     if source_run is not None:
         overview["source_run"] = str(source_run)
-        overview["only"] = only
+        overview["rerun_stages"] = list(rerun_stages)
+        if len(rerun_stages) == 1:
+            overview["only"] = rerun_stages[0]
     (run_dir / "run.json").write_text(json.dumps(overview, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     write_report(run_dir, results)
 
@@ -279,9 +282,9 @@ def parser() -> argparse.ArgumentParser:
     group.add_argument("--host", help="one hostname")
     group.add_argument("--hosts-file", type=Path, help="one hostname per line")
     ap.add_argument("--port", type=int)
-    ap.add_argument("--from-run", type=Path, help="reuse a completed run for one wordlist stage")
+    ap.add_argument("--from-run", type=Path, help="reuse a completed run and rerun stages selected by wordlist flags")
     ap.add_argument("--only", choices=("prefixes", "paths", "extensions"),
-                    help="wordlist stage to rerun with --from-run")
+                    help="optional explicit single stage for legacy reruns")
     ap.add_argument("--host-prefixes-wordlist", type=Path)
     ap.add_argument("--paths-wordlist", type=Path)
     ap.add_argument("--extensions-wordlist", type=Path)
@@ -303,10 +306,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.from_run is None and ((args.host is None and args.hosts_file is None) or args.port is None):
         ap.error("fresh runs require --host or --hosts-file and --port")
     if args.from_run is not None:
-        if args.host is not None or args.hosts_file is not None or args.port is not None:
-            ap.error("--from-run reads hosts and port from the source run")
+        if args.hosts_file is not None:
+            ap.error("--from-run reads the host list from the source run; omit --hosts-file")
         if args.only is None:
-            ap.error("--from-run requires --only")
+            args.rerun_stages = tuple(stage for stage, name in (
+                ("prefixes", "host_prefixes_wordlist"),
+                ("paths", "paths_wordlist"),
+                ("extensions", "extensions_wordlist"),
+            ) if getattr(args, name) is not None)
+            if not args.rerun_stages:
+                ap.error("--from-run requires at least one wordlist flag")
+        else:
+            args.rerun_stages = (args.only,)
         if args.only == "prefixes" and args.host_prefixes_wordlist is None:
             ap.error("--only prefixes requires --host-prefixes-wordlist")
         if args.only == "paths" and args.paths_wordlist is None:
