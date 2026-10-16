@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+web-recon-*/
+runs/
+.DS_Store

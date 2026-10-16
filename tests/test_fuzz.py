@@ -1,0 +1,264 @@
+import json
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from webrecon import fuzz
+
+
+def hit(word, url, *, status=200, length=120, words=20, lines=4):
+    return {
+        "input": {"FUZZ": word},
+        "url": url,
+        "status": status,
+        "length": length,
+        "words": words,
+        "lines": lines,
+    }
+
+
+BASELINE = {"status": 200, "length": 100, "words": 10, "lines": 2}
+PAIR = {"probes": [BASELINE, BASELINE]}
+
+
+class FuzzTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.commands = []
+
+    def wordlist(self, name, content):
+        path = self.root / name
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def scanner(self, results_by_name, returncode=0):
+        def run(argv, **kwargs):
+            self.commands.append(argv)
+            output = Path(argv[argv.index("-o") + 1])
+            name = output.stem
+            output.write_text(json.dumps({"results": results_by_name.get(name, [])}), encoding="utf-8")
+            return subprocess.CompletedProcess(argv, returncode, b"scanner output", b"scanner error")
+
+        return run
+
+    def test_vhost_prefixes_exact_input_and_filters_default_host(self):
+        names = self.wordlist("names.txt", "admin\nrandom\n")
+        results = {
+            "vhost": [
+                hit("admin", "http://box.htb:8080/", length=500),
+                hit("random", "http://box.htb:8080/", length=100, words=10, lines=2),
+            ]
+        }
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), patch.object(
+            fuzz, "_save_controls", return_value=([BASELINE, BASELINE], [], [])
+        ), patch.object(fuzz.subprocess, "run", side_effect=self.scanner(results)):
+            report = fuzz.run_vhost("http://box.htb:8080", "box.htb", names, self.root / "out")
+        self.assertEqual(report["status"], "completed")
+        self.assertEqual([x["hostname"] for x in report["candidates"]], ["admin.box.htb"])
+        command = self.commands[0]
+        self.assertIn("Host: FUZZ.box.htb", command)
+        self.assertNotIn("-recursion", command)
+        self.assertTrue((self.root / "out" / "vhost.status.json").is_file())
+        self.assertTrue((self.root / "out" / "vhost.stdout").is_file())
+        self.assertTrue((self.root / "out" / "vhost.stderr").is_file())
+
+    def test_vhost_missing_control_keeps_hit_uncertain(self):
+        names = self.wordlist("names.txt", "admin\n")
+        results = {"vhost": [hit("admin", "http://box.htb/", length=500)]}
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), patch.object(
+            fuzz, "_save_controls", return_value=([BASELINE], [], ["second probe failed"])
+        ), patch.object(fuzz.subprocess, "run", side_effect=self.scanner(results)):
+            report = fuzz.run_vhost("http://box.htb", "box.htb", names, self.root / "out")
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(report["candidates"], [])
+        self.assertEqual(report["uncertain_hits"][0]["hostname"], "admin.box.htb")
+        self.assertEqual(report["uncertain_hits"][0]["assessment"], "baseline_unavailable")
+        self.assertTrue((self.root / "out" / "vhost.json").is_file())
+
+    def test_paths_keep_only_hits_different_from_missing_path(self):
+        names = self.wordlist("paths.txt", "fallback\nadmin\n")
+        results = {
+            "paths": [
+                hit("fallback", "https://box.htb/fallback", length=100, words=10, lines=2),
+                hit("admin", "https://box.htb/admin", status=302, length=0, words=0, lines=0),
+            ]
+        }
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), patch.object(
+            fuzz.subprocess, "run", side_effect=self.scanner(results)
+        ):
+            report = fuzz.run_paths("https://box.htb", names, self.root / "out", baseline=PAIR)
+        self.assertEqual([x["url"] for x in report["candidates"]], ["https://box.htb/admin"])
+        self.assertEqual(report["candidates"][0]["assessment"], "different_from_missing_baseline")
+        self.assertIn("https://box.htb/FUZZ", self.commands[0])
+
+    def test_paths_unstable_controls_keep_hits_uncertain(self):
+        names = self.wordlist("paths.txt", "admin\n")
+        results = {"paths": [hit("admin", "http://box.htb/admin", length=500)]}
+        different = {"status": 200, "length": 120, "words": 10, "lines": 2}
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), patch.object(
+            fuzz, "_save_controls", return_value=([BASELINE, different], [], [])
+        ), patch.object(fuzz.subprocess, "run", side_effect=self.scanner(results)):
+            report = fuzz.run_paths("http://box.htb", names, self.root / "out")
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(report["candidates"], [])
+        self.assertEqual(report["uncertain_hits"][0]["url"], "http://box.htb/admin")
+        self.assertEqual(report["uncertain_hits"][0]["assessment"], "unstable_missing_baseline")
+        self.assertTrue((self.root / "out" / "paths.json").is_file())
+
+    def test_extension_then_filename_scan_respects_extra_request_cap(self):
+        extensions = self.wordlist("extensions.txt", "php\n# ignored\n.txt\n")
+        paths = self.wordlist("paths.txt", "admin\nlogin\nprofile\nconfig\n")
+        results = {
+            "extension-stem-1": [hit(".php", "http://box.htb/index.php", length=400)],
+            "extension-filenames-1": [hit("admin", "http://box.htb/admin.php", length=450)],
+        }
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), patch.object(
+            fuzz.subprocess, "run", side_effect=self.scanner(results)
+        ), patch.object(fuzz, "_save_controls", return_value=([BASELINE, BASELINE], [], [])) as controls:
+            report = fuzz.run_extensions(
+                "http://box.htb", paths, extensions, [], self.root / "out", 2, baseline=BASELINE
+            )
+        self.assertEqual(report["status"], "completed")
+        self.assertEqual(report["confirmed_extensions"], [".php"])
+        self.assertEqual(report["extra_request_count"], 2)
+        self.assertEqual([x["phase"] for x in report["candidates"]], ["known_basename", "known_extension"])
+        self.assertIn("http://box.htb/indexFUZZ", self.commands[0])
+        self.assertIn("http://box.htb/FUZZ.php", self.commands[1])
+        self.assertEqual((self.root / "out" / "extension-names-1.txt").read_text(), "admin\nlogin\n")
+        self.assertEqual((self.root / "out" / "extensions.normalized.txt").read_text(), ".php\n.txt\n")
+        self.assertEqual(controls.call_count, 1)
+        self.assertEqual(controls.call_args.kwargs["path_suffix"], ".php")
+
+    def test_php_fallback_does_not_confirm_extension_or_scan_names(self):
+        extensions = self.wordlist("extensions.txt", ".php\n")
+        paths = self.wordlist("paths.txt", "admin\nlogin\n")
+        php_fallback = {"status": 200, "length": 400, "words": 20, "lines": 4}
+        results = {
+            "extension-stem-1": [hit(".php", "http://box.htb/index.php", length=400)],
+            "extension-stem-2": [hit(".php", "http://box.htb/login.php", length=400)],
+        }
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), patch.object(
+            fuzz.subprocess, "run", side_effect=self.scanner(results)
+        ), patch.object(fuzz, "_save_controls", return_value=([php_fallback, php_fallback], [], [])) as controls:
+            report = fuzz.run_extensions(
+                "http://box.htb", paths, extensions, ["login"], self.root / "out", 100000,
+                baseline=BASELINE,
+            )
+        self.assertEqual(report["status"], "completed")
+        self.assertEqual(report["confirmed_extensions"], [])
+        self.assertEqual(report["extra_request_count"], 0)
+        self.assertEqual(report["candidates"], [])
+        self.assertEqual(controls.call_count, 1)
+        self.assertEqual(len(self.commands), 2)
+
+    def test_incomplete_extension_controls_do_not_trigger_name_scan(self):
+        extensions = self.wordlist("extensions.txt", ".php\n")
+        paths = self.wordlist("paths.txt", "admin\n")
+        results = {"extension-stem-1": [hit(".php", "http://box.htb/index.php", length=400)]}
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), patch.object(
+            fuzz.subprocess, "run", side_effect=self.scanner(results)
+        ), patch.object(fuzz, "_save_controls", return_value=([BASELINE], [], ["one probe failed"])):
+            report = fuzz.run_extensions("http://box.htb", paths, extensions, [], self.root / "out", 100)
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(report["confirmed_extensions"], [])
+        self.assertEqual(report["extra_request_count"], 0)
+        self.assertEqual(report["candidates"], [])
+        self.assertEqual(report["uncertain_hits"][0]["assessment"], "extension_baseline_unavailable")
+
+    def test_extension_controls_probe_two_missing_files_with_same_suffix(self):
+        observed = []
+
+        def probe(origin, path, host_header=None):
+            observed.append(path)
+            return {
+                "status": 404, "length": 3, "words": 1, "lines": 1,
+                "truncated": False, "headers": [], "body": b"404",
+            }
+
+        with patch.object(fuzz, "_probe", side_effect=probe):
+            controls, artifacts, diagnostics = fuzz._save_controls(
+                "http://box.htb", self.root, "extension-php", path_suffix=".php"
+            )
+        self.assertEqual(len(controls), 2)
+        self.assertEqual(len(observed), 2)
+        self.assertTrue(all(path.startswith("/webrecon-missing-") and path.endswith(".php") for path in observed))
+        self.assertEqual(diagnostics, [])
+        self.assertEqual(len(artifacts), 4)
+
+    def test_partial_scanner_failure_remains_error_with_artifacts(self):
+        names = self.wordlist("paths.txt", "admin\n")
+        results = {"paths": [hit("admin", "http://box.htb/admin", length=500)]}
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), patch.object(
+            fuzz.subprocess, "run", side_effect=self.scanner(results, returncode=2)
+        ):
+            report = fuzz.run_paths("http://box.htb", names, self.root / "out", baseline=PAIR)
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(len(report["candidates"]), 1)
+        self.assertTrue(any("partial results" in text for text in report["diagnostics"]))
+        self.assertTrue((self.root / "out" / "paths.json").is_file())
+
+    def test_https_uses_insecure_tls_and_incomplete_baseline_still_probes(self):
+        names = self.wordlist("paths.txt", "admin\n")
+        response = {
+            "status": 200,
+            "length": 8,
+            "words": 1,
+            "lines": 1,
+            "truncated": False,
+            "headers": [("Content-Type", "text/html")],
+            "body": b"baseline",
+        }
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), patch.object(
+            fuzz, "_probe", side_effect=lambda *args: response.copy()
+        ) as probe, patch.object(fuzz.subprocess, "run", side_effect=self.scanner({"paths": []})):
+            report = fuzz.run_paths(
+                "https://box.htb", names, self.root / "out", baseline={"status": 200, "size": 8}
+            )
+        self.assertEqual(report["status"], "completed")
+        self.assertEqual(probe.call_count, 2)
+        self.assertEqual(len(report["controls"]), 2)
+        self.assertIn("-k", self.commands[0])
+        self.assertTrue((self.root / "out" / "path-control-1.body").is_file())
+
+    def test_missing_ffuf_and_start_failure_return_unavailable(self):
+        names = self.wordlist("paths.txt", "admin\n")
+        with patch.object(fuzz.shutil, "which", return_value=None):
+            report = fuzz.run_paths("http://box.htb", names, self.root / "absent", baseline=PAIR)
+        self.assertEqual(report["status"], "unavailable")
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), patch.object(
+            fuzz.subprocess, "run", side_effect=FileNotFoundError("ffuf disappeared")
+        ):
+            report = fuzz.run_paths("http://box.htb", names, self.root / "failed", baseline=PAIR)
+        self.assertEqual(report["status"], "unavailable")
+        self.assertTrue((self.root / "failed" / "paths.status.json").is_file())
+
+    def test_other_start_error_is_reported(self):
+        names = self.wordlist("paths.txt", "admin\n")
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), patch.object(
+            fuzz.subprocess, "run", side_effect=PermissionError("blocked")
+        ):
+            report = fuzz.run_paths("http://box.htb", names, self.root / "failed", baseline=PAIR)
+        self.assertEqual(report["status"], "error")
+
+    def test_ffuf_request_errors_make_scan_incomplete(self):
+        names = self.wordlist("paths.txt", "admin\n")
+
+        def run(argv, **kwargs):
+            output = Path(argv[argv.index("-o") + 1])
+            output.write_text(json.dumps({"results": []}), encoding="utf-8")
+            return subprocess.CompletedProcess(argv, 0, b":: Errors : 3\n", b"")
+
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), patch.object(
+            fuzz.subprocess, "run", side_effect=run
+        ):
+            report = fuzz.run_paths("http://box.htb", names, self.root / "out", baseline=PAIR)
+        self.assertEqual(report["status"], "error")
+        self.assertTrue(any("3 request errors" in item for item in report["diagnostics"]))
+
+
+if __name__ == "__main__":
+    unittest.main()
