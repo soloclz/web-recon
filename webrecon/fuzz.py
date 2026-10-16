@@ -517,6 +517,7 @@ def run_extensions(
     confirmed: set[str] = set()
     control_warnings: set[str] = set()
     status = "completed"
+    known_basename_status = "completed"
     for index, stem in enumerate(stems, 1):
         hits, new_artifacts, new_diagnostics, scan_status = _scan(
             out_dir, f"extension-stem-{index}", normalized, f"{origin}/{stem}FUZZ", progress=progress
@@ -525,6 +526,7 @@ def run_extensions(
         diagnostics.extend(new_diagnostics)
         if scan_status != "completed":
             status = scan_status
+            known_basename_status = scan_status
         if scan_status == "unavailable":
             break
         for hit in hits:
@@ -534,6 +536,7 @@ def run_extensions(
             assessment = _extension_assessment(hit, extension_controls(extension))
             if assessment == "extension_baseline_unavailable":
                 status = "error"
+                known_basename_status = "error"
                 if extension not in control_warnings:
                     diagnostics.append(f"extension {extension}: missing or truncated control response")
                     control_warnings.add(extension)
@@ -608,5 +611,93 @@ def run_extensions(
         controls=[item for group in controls_by_extension.values() for item in group],
         controls_by_extension=controls_by_extension,
         confirmed_extensions=sorted(confirmed),
+        known_basename_status=known_basename_status,
         extra_request_count=request_count,
+    )
+
+
+def run_extension_filenames(
+    origin: str,
+    paths_wordlist: Path,
+    confirmed_extensions: list[str],
+    out_dir: Path,
+    max_extra_requests: int = 100000,
+    *,
+    progress: Callable[[str, int, int], None] | None = None,
+) -> dict:
+    """Rescan only names for extensions confirmed by a previous run."""
+    if not confirmed_extensions or max_extra_requests == 0:
+        return _report("not_run", extra_request_count=0)
+    error = _wordlist_check(paths_wordlist)
+    if error:
+        return _report("error", diagnostics=[error], extra_request_count=0)
+    if max_extra_requests < 0:
+        return _report("error", diagnostics=["max_extra_requests must be nonnegative"], extra_request_count=0)
+    if not shutil.which("ffuf"):
+        return _report("unavailable", diagnostics=["ffuf is not installed"], extra_request_count=0)
+    try:
+        origin = _origin(origin)
+    except ValueError as exc:
+        return _report("error", diagnostics=[str(exc)], extra_request_count=0)
+    extensions = sorted(set(confirmed_extensions))
+    if any(not re.fullmatch(r"\.[A-Za-z0-9_-]{1,20}", item) for item in extensions):
+        return _report("error", diagnostics=["invalid confirmed extension"], extra_request_count=0)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    candidates: list[dict] = []
+    uncertain_hits: list[dict] = []
+    artifacts: list[str] = []
+    diagnostics: list[str] = []
+    controls_by_extension: dict[str, list[dict]] = {}
+    request_count = 0
+    status = "completed"
+    for index, extension in enumerate(extensions, 1):
+        allocation = max_extra_requests // len(extensions) + (index <= max_extra_requests % len(extensions))
+        if allocation <= 0:
+            continue
+        limited = out_dir / f"extension-names-{index}.txt"
+        count = _write_limited_names(paths_wordlist, limited, allocation)
+        artifacts.append(str(limited))
+        if count == 0:
+            continue
+        request_count += count
+        kind = f"extension-{extension[1:]}"
+        controls, new_artifacts, new_diagnostics = _save_controls(
+            origin, out_dir, kind, path_suffix=extension
+        )
+        controls_by_extension[extension] = controls
+        artifacts.extend(new_artifacts)
+        diagnostics.extend(new_diagnostics)
+        if not _stable_control_pair(controls):
+            diagnostics.append(f"extension {extension}: missing or unstable control responses")
+            status = "error"
+        hits, new_artifacts, new_diagnostics, scan_status = _scan(
+            out_dir, f"extension-filenames-{index}", limited, f"{origin}/FUZZ{extension}",
+            progress=progress,
+        )
+        artifacts.extend(new_artifacts)
+        diagnostics.extend(new_diagnostics)
+        if scan_status != "completed":
+            status = scan_status
+        for hit in hits:
+            assessment = _extension_assessment(hit, controls)
+            if assessment == "matches_missing_baseline":
+                continue
+            word = _fuzz_input(hit)
+            item = {
+                "url": hit.get("url") or f"{origin}/{quote(word or '', safe='._-')}{extension}",
+                "extension": extension,
+                "phase": "known_extension",
+                "source": "ffuf_extension",
+                **_hit_info(hit, assessment),
+            }
+            if assessment == "different_from_missing_baseline":
+                candidates.append(item)
+            else:
+                uncertain_hits.append(item)
+    return _report(
+        status, candidates=candidates, uncertain_hits=uncertain_hits,
+        artifacts=artifacts, diagnostics=diagnostics,
+        controls=[item for group in controls_by_extension.values() for item in group],
+        controls_by_extension=controls_by_extension,
+        confirmed_extensions=extensions, extra_request_count=request_count,
     )

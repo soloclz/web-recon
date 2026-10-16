@@ -7,6 +7,7 @@ answer for a hostname that the operating system resolves through hosts.
 
 from __future__ import annotations
 
+import copy
 import ipaddress
 import json
 import re
@@ -319,5 +320,122 @@ def run_dns(host: str, ips: list[str], prefix_wordlist: Path | None,
     result["candidates"] = list(candidates.values())
     scanner_failed = (prefix_wordlist is not None and
                       result["scanner"]["status"] != "completed")
+    result["status"] = "partial" if result["required_failures"] or scanner_failed else "completed"
+    return result
+
+
+def rerun_dns_words(previous_dns: dict, host: str, prefix_wordlist: Path | None,
+                    out_dir: Path) -> dict:
+    """Replace only the Gobuster stage in a saved DNS result; never call dig.
+
+    Fixed DNS queries, their artifacts, and PTR/AXFR candidates stay in the
+    result. The caller must keep those referenced artifacts available and use a
+    new output directory for this attempt's Gobuster artifacts.
+    """
+    host = _name(host)
+    if not isinstance(previous_dns, dict) or not all(
+        key in previous_dns for key in ("records", "zone", "candidates", "queries",
+                                  "artifacts", "diagnostics", "required_failures", "wildcard")
+    ):
+        raise ValueError("previous DNS result is incomplete")
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    result = copy.deepcopy(previous_dns)
+
+    # A fixed source may also have found a name that Gobuster found. In that
+    # case keep the fixed candidate, but remove the old scanner's annotations.
+    fixed_candidates: dict[str, dict] = {}
+    for item in result["candidates"]:
+        if item.get("source") == "gobuster_dns":
+            continue
+        candidate = item.copy()
+        other_sources = [source for source in candidate.get("other_sources", [])
+                         if source != "gobuster_dns"]
+        if other_sources:
+            candidate["other_sources"] = other_sources
+        else:
+            candidate.pop("other_sources", None)
+        if "gobuster_dns" in item.get("other_sources", []):
+            candidate.pop("addresses", None)
+            candidate.pop("wildcard_match", None)
+        fixed_candidates[candidate["name"]] = candidate
+
+    old_scanner_artifacts = set()
+    fixed_queries = []
+    for query in result["queries"]:
+        command = query.get("command") or []
+        if command and command[0] == "gobuster":
+            old_scanner_artifacts.update(query.get(key) for key in ("stdout", "stderr", "meta"))
+        else:
+            fixed_queries.append(query)
+    old_scanner = result.get("scanner", {})
+    old_scanner_artifacts.update(old_scanner.get(key) for key in ("stdout", "stderr"))
+    old_scanner_names = {Path(path).name for path in old_scanner_artifacts if path}
+    result["queries"] = fixed_queries
+    result["artifacts"] = [path for path in result["artifacts"]
+                           if path not in old_scanner_artifacts and Path(path).name not in old_scanner_names]
+    result["diagnostics"] = [line for line in result["diagnostics"]
+                             if not line.startswith(("gobuster-dns:", "gobuster wordlist not found:"))]
+    result["scanner"] = {"status": "not_run"}
+
+    # run_dns stops before Gobuster if no input record or confirmed zone was
+    # found. The saved records contain only records owned by the input host.
+    usable = any(result["records"].get(rr_type) for rr_type in RECORD_TYPES)
+    if not usable and not result["zone"].get("confirmed", False):
+        result["status"] = "error" if result["required_failures"] else "unavailable"
+        if prefix_wordlist is not None:
+            result["scanner"] = {
+                "status": "error" if result["required_failures"] else "unavailable",
+                "reason": "DNS checks failed" if result["required_failures"] else
+                          "no input record or confirmed DNS zone"}
+        result["candidates"] = list(fixed_candidates.values())
+        return result
+
+    if prefix_wordlist is not None:
+        prefix_wordlist = Path(prefix_wordlist)
+        if not prefix_wordlist.is_file():
+            result["diagnostics"].append(f"gobuster wordlist not found: {prefix_wordlist}")
+            result["scanner"] = {"status": "error", "reason": "wordlist not found"}
+        else:
+            if any((out_dir / f"gobuster-dns.{suffix}").exists()
+                   for suffix in ("stdout.txt", "stderr.txt", "json")):
+                raise FileExistsError(f"Gobuster artifacts already exist in {out_dir}")
+            run = _write_command(out_dir, "gobuster-dns",
+                                 ["gobuster", "dns", "--domain", host,
+                                  "-w", str(prefix_wordlist)], 600)
+            result["queries"].append({key: value for key, value in run.items()
+                                      if key != "output"})
+            result["artifacts"].extend([run["stdout"], run["stderr"], run["meta"]])
+            if run["returncode"] is None or run["returncode"] != 0:
+                result["diagnostics"].append(
+                    "gobuster-dns: timeout" if run["timed_out"] else
+                    f"gobuster-dns: exit {run['returncode']}; see stderr")
+            result["scanner"] = {"status": run["status"],
+                                 "command": run["command"],
+                                 "stdout": run["stdout"], "stderr": run["stderr"]}
+            wildcard_addresses = set(result["wildcard"].get("addresses", []))
+            for line in run["output"].splitlines():
+                found = _GOBUSTER_FOUND_RE.match(line)
+                if not found:
+                    continue
+                found_name = found.group(1).rstrip(".").lower()
+                if not found_name.endswith(f".{host}"):
+                    continue
+                address_text = found.group(2) or found.group(3) or ""
+                addresses = re.findall(r"(?:\d{1,3}\.){3}\d{1,3}|[0-9a-f:]{2,}",
+                                       address_text, re.I)
+                candidate_addresses = []
+                for address in addresses:
+                    try:
+                        candidate_addresses.append(str(ipaddress.ip_address(address)))
+                    except ValueError:
+                        pass
+                _add_candidate(fixed_candidates, found_name, "gobuster_dns",
+                               addresses=candidate_addresses,
+                               wildcard_match=bool(candidate_addresses and
+                                                   set(candidate_addresses) == wildcard_addresses))
+
+    result["candidates"] = list(fixed_candidates.values())
+    scanner_failed = (prefix_wordlist is not None and result["scanner"]["status"] != "completed")
     result["status"] = "partial" if result["required_failures"] or scanner_failed else "completed"
     return result

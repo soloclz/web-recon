@@ -19,6 +19,27 @@ python3 scripts/web-recon.py --hosts-file hosts.txt --port 443 \
 
 `--paths-wordlist` 由 `ffuf` 掃根路徑，不遞迴。`--extensions-wordlist` 先測 `indexFUZZ` 等已觀察檔名；如找到與 missing baseline 不同的 `.php` response，才用 path 字典測 `FUZZ.php`。`--max-extra-requests` 限制這個第二階段的 request 數，預設 100,000。三種字典可各自省略。
 
+### 只重跑換過的字典
+
+從**已完成**的 run 沿用解析、Web crawl 與其他 scanner 結果；另建一個輸出目錄，不修改原 run。例如只換 path 字典：
+
+```bash
+python3 scripts/web-recon.py --from-run ./runs/example --only paths \
+  --paths-wordlist /usr/share/seclists/Discovery/Web-Content/big.txt \
+  --out-dir ./runs/example-paths-big
+```
+
+`--from-run` 從原 run 的 `run.json` 讀 hostname 和 port，不再傳 `--host` 或 `--port`。三種重跑方式：
+
+| `--only` | 必填字典 | 本輪執行的階段 |
+| --- | --- | --- |
+| `prefixes` | `--host-prefixes-wordlist` | Gobuster DNS 字典與 ffuf vhost；沿用舊 DNS record、PTR、zone 與 AXFR 結果 |
+| `paths` | `--paths-wordlist` | ffuf path；如果舊 run 已確認 extension，也用新 path 字典重跑該 extension 的檔名掃描 |
+| `extensions` | `--extensions-wordlist` | 已觀察檔名的 extension 掃描；確認 extension 後，沿用舊 path 字典做檔名掃描 |
+
+重跑 extension 時，若舊 path 字典已搬走，可額外傳 `--paths-wordlist` 指定現有檔案。新 run 的 `report.md` 合併舊結果和本輪結果；舊 raw evidence 仍從原 run 連結，因此要保留原 run 目錄。讀取正在執行中的 run 會因缺少 `run.json` 而停止。
+重跑的 exit code 依本輪指定階段判定；報表仍保留整個 host 的狀態，所以舊 DNS 階段 `unavailable` 可能讓 host 顯示 `partial`，即使新的 path 掃描完成。
+
 執行開始會印出輸出目錄。終端顯示各階段的開始、完成、耗時，以及 `ffuf` 當次掃描的 `已測數/總數`；`progress.jsonl` 同步保存這些事件，可在另一個 terminal 用 `tail -f <輸出目錄>/progress.jsonl` 查看。DNS 與 Web 檢查可同時進行。每個 origin 的 vhost、path、extension 掃描預設依序執行；加入 `--scanner-workers 2` 或 `3` 可同時跑最多 2 或 3 個 `ffuf` 階段。每個 `ffuf` 仍各以 20 requests/s 為上限，因此 2 個 worker 的合計上限是 40 requests/s。`--hosts-file` 的 hostname 仍逐一處理。
 
 `--public-sources` 才查 crt.sh 與 Wayback CDX；候選 hostname 不會在同一輪自動探測。`.htb` 等內部名稱不送到公共資料來源。當前服務的 TLS certificate SAN 始終檢查。來源、上限與輸出見 [公開資料來源](docs/public-sources.md)。
@@ -35,7 +56,14 @@ python3 scripts/web-recon.py --hosts-file hosts.txt --port 443 \
 
 未指定 `--out-dir` 時，在目前目錄新建 `web-recon-YYYYMMDD-HHMMSS`，不覆寫舊執行。指定的輸出目錄須尚不存在。
 
+**先看 `report.md`**：它把各 hostname 的完成狀態、候選與證據連結整理在同一個檔案。候選過多時顯示前 30 筆，完整清單仍在對應的 `summary.json`。舊版已完成的 run 也能直接生成報表，無須重新送 request：
+
+```bash
+python3 -m webrecon.report ./runs/old-run
+```
+
 ```text
+report.md                 整輪閱讀入口：狀態、候選、原始證據連結
 run.json                  批次完成狀態
 progress.jsonl            執行中的階段與 ffuf 進度
 new-hosts.txt             可作下一輪 --hosts-file 輸入的候選 hostname
@@ -49,6 +77,8 @@ hosts/<hostname>-<hash>/public/
 ```
 
 `responses/*.jsonl` 由從 `pentest-notes` 複製的離線 `scripts/web-summary.py` 產生，抽出 headers、title、cookie 名稱相關 fingerprint、form／hidden field、link、script、comment 等線索；原始 response 仍保留在同一 prefix 的檔案。`new-hosts.txt` 是候選清單，使用前依 `new-hosts.jsonl` 的來源與目標範圍挑選。`source_ip_port` 指起始 Web host 的連線端點，並非候選 hostname 已解析的 IP；公共資料來源的候選沒有此映射。
+
+原始檔數量多，是因為每次 Web request 分別保存 headers、body、curl 狀態、錯誤及離線摘要；每次 `dig`／`ffuf`／`gobuster` 也保存原始 output 與執行狀態。判讀候選時可從 `report.md` 的連結回查 response 和 missing-path／default-vhost 控制組；平常閱讀不需要逐一打開原始檔。
 
 ## 驗證
 

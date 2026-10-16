@@ -71,6 +71,31 @@ try:
     cli_summary = json.loads(next(cli_out.glob("hosts/*/summary.json")).read_text())
     cli_scanners = cli_summary["scanners"]["http"]
     cli_events = [json.loads(line) for line in (cli_out / "progress.jsonl").read_text().splitlines()]
+    rerun_outputs = {}
+    for stage, flag, wordlist in (
+        ("prefixes", "--host-prefixes-wordlist", prefixes),
+        ("paths", "--paths-wordlist", paths),
+        ("extensions", "--extensions-wordlist", extensions),
+    ):
+        out = root / f"rerun-{stage}"
+        code = main(["--from-run", str(cli_out), "--only", stage,
+                     flag, str(wordlist), "--max-extra-requests", "2",
+                     "--out-dir", str(out)])
+        summary = json.loads(next(out.glob("hosts/*/summary.json")).read_text())
+        rerun_outputs[stage] = {"exit_code": code, "status": summary["status"],
+                                "rerun_status": summary["rerun"]["status"],
+                                "report": str(out / "report.md")}
+        if stage in ("paths", "extensions"):
+            assert code == 0 and summary["rerun"]["status"] == "completed"
+        assert (out / "report.md").is_file()
+        assert not next(out.glob("hosts/*/responses"), None)
+        if stage == "paths":
+            assert summary["scanners"]["http"]["extensions"]["filename_rescan"]["status"] == "completed"
+            assert summary["scanners"]["http"]["extensions"]["known_basename_status"] == "completed"
+        if stage == "extensions":
+            assert ".php" in summary["scanners"]["http"]["extensions"]["confirmed_extensions"]
+        if stage == "prefixes":
+            assert any(x["hostname"] == "admin.localhost" for x in summary["scanners"]["http"]["vhost"]["candidates"])
     evidence = {
         "fixture_port": server.server_port,
         "vhost": {"status": vhost["status"], "candidates": vhost["candidates"],
@@ -85,6 +110,7 @@ try:
         "cli": {"exit_code": cli_exit, "status": cli_summary["status"],
                 "scanner_status": {name: stage["status"] for name, stage in cli_scanners.items()},
                 "progress_events": len(cli_events)},
+        "reruns": rerun_outputs,
     }
     (root / "verification.json").write_text(json.dumps(evidence, indent=2) + "\n")
     print(root)
