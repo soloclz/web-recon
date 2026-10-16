@@ -33,19 +33,21 @@ root = Path(mkdtemp(prefix="web-recon-extend-"))
 paths = root / "paths.txt"
 paths.write_text("one\n")
 hosts = root / "hosts.txt"
-hosts.write_text("localhost\n127.0.0.1\n")
+hosts.write_text("127.0.0.1\n127.0.0.2\n")
 server = ThreadingHTTPServer(("127.0.0.1", 0), Site)
+second_server = ThreadingHTTPServer(("127.0.0.2", server.server_port), Site)
 Thread(target=server.serve_forever, daemon=True).start()
+Thread(target=second_server.serve_forever, daemon=True).start()
 try:
     first = root / "first"
-    main(["--host", "localhost", "--port", str(server.server_port),
+    main(["--host", "127.0.0.1", "--port", str(server.server_port),
           "--paths-wordlist", str(paths), "--out-dir", str(first)])
     second = root / "second"
     main(["--extend-run", str(first), "--hosts-file", str(hosts),
           "--out-dir", str(second)])
     actions = {item["host"]: item["action"] for item in json.loads(
         (second / "run.json").read_text())["hosts"]}
-    assert actions == {"localhost": "reused", "127.0.0.1": "scanned"}, actions
+    assert actions == {"127.0.0.1": "reused", "127.0.0.2": "scanned"}, actions
 
     paths.write_text("two\n")
     third = root / "third"
@@ -53,7 +55,7 @@ try:
           "--out-dir", str(third)])
     actions = {item["host"]: item["action"] for item in json.loads(
         (third / "run.json").read_text())["hosts"]}
-    assert actions == {"localhost": "updated", "127.0.0.1": "updated"}, actions
+    assert actions == {"127.0.0.1": "updated", "127.0.0.2": "updated"}, actions
     for summary_path in third.glob("hosts/*/summary.json"):
         summary = json.loads(summary_path.read_text())
         assert summary["rerun"]["stages"] == ["paths"], summary_path
@@ -61,6 +63,7 @@ try:
         assert not (summary_path.parent / "responses").exists(), summary_path
     assert (third / "report.md").is_file()
     print(json.dumps({"directory": str(root), "second_actions": {
-        "localhost": "reused", "127.0.0.1": "scanned"}, "third_actions": actions}, indent=2))
+        "127.0.0.1": "reused", "127.0.0.2": "scanned"}, "third_actions": actions}, indent=2))
 finally:
     server.shutdown()
+    second_server.shutdown()
