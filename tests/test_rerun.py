@@ -97,14 +97,19 @@ class RerunTests(unittest.TestCase):
         self.assertEqual((self.host_dir / "summary.json").read_bytes(), original)
         self.assertEqual(summary["scanners"]["http"]["paths"], self.result["scanners"]["http"]["paths"])
         self.assertEqual([item["name"] for item in summary["new_hosts"]], ["new.box.example.test"])
-        self.assertTrue(summary["web"]["http"]["pages"][0]["prefix"].startswith(str(self.source.resolve())))
+        prefix = summary["web"]["http"]["pages"][0]["prefix"]
+        self.assertFalse(Path(prefix).is_absolute())
+        self.assertEqual((output / f"{prefix}.body").read_text(), "<form action='/login'></form>")
         report = (output / "report.md").read_text()
         self.assertIn("new.box.example.test", report)
-        self.assertIn("source/hosts/", report)
+        self.assertIn("Referenced reused evidence is included in this run", report)
         self.assertIn("[summary.json](hosts/", report)
         for href in re.findall(r"\]\(([^)]+)\)", report):
-            self.assertTrue((output / unquote(href)).resolve().is_file(), href)
+            target = (output / unquote(href)).resolve()
+            self.assertTrue(target.is_relative_to(output.resolve()), href)
+            self.assertTrue(target.is_file(), href)
         self.assertFalse((rerun._host_dir(output, self.host) / "responses").exists())
+        self.assertTrue((rerun._host_dir(output, self.host) / "reused").is_dir())
 
     def test_path_replaces_path_and_only_extension_filename_phase(self):
         wordlist = self._wordlist("paths.txt")

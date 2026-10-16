@@ -45,7 +45,7 @@ python3 scripts/web-recon.py --from-run ./runs/example \
 | `--paths-wordlist` | ffuf path；如果舊 run 已確認 extension，也用新 path 字典重跑該 extension 的檔名掃描 |
 | `--extensions-wordlist` | 已觀察檔名的 extension 掃描；確認 extension 後，沿用舊 path 字典做檔名掃描 |
 
-同時傳 path 與 extension 字典時，完整 extension 掃描使用新 path 字典，不另外跑舊 extension 的檔名重掃。舊版 `--only` 命令仍可使用；舊 path 字典已搬走而只想重跑 extension 時，可用 `--only extensions --extensions-wordlist ... --paths-wordlist ...` 指定現有 path 字典，而不重跑 path 階段。這個 override 記在 `run.json` 的 `wordlists.extension_names_wordlist`，原 path 掃描使用的字典仍記在 `wordlists.paths_wordlist`。新 run 的 `report.md` 合併舊結果和本輪結果；舊 raw evidence 仍從原 run 連結，因此要保留原 run 目錄。讀取正在執行中的 run 會因缺少 `run.json` 而停止。
+同時傳 path 與 extension 字典時，完整 extension 掃描使用新 path 字典，不另外跑舊 extension 的檔名重掃。舊版 `--only` 命令仍可使用；舊 path 字典已搬走而只想重跑 extension 時，可用 `--only extensions --extensions-wordlist ... --paths-wordlist ...` 指定現有 path 字典，而不重跑 path 階段。這個 override 記在 `run.json` 的 `wordlists.extension_names_wordlist`，原 path 掃描使用的字典仍記在 `wordlists.paths_wordlist`。新 run 的 `report.md` 合併舊結果和本輪結果；`report.md` 與 `summary.json` 引用的舊 raw evidence 會複製到新 run 的 `hosts/<hostname>-<hash>/reused/`，因此這些連結在單獨搬移新 run 後仍可使用。字典路徑仍指向使用者指定的檔案；要再重跑需要該字典仍存在，或重新指定字典。讀取正在執行中的 run 會因缺少 `run.json` 而停止。
 重跑的 exit code 依本輪指定階段判定；報表仍保留整個 host 的狀態，所以舊 DNS 階段 `unavailable` 可能讓 host 顯示 `partial`，即使新的 path 掃描完成。
 
 執行開始會印出輸出目錄。終端顯示各階段的開始、完成、耗時，以及 `ffuf` 當次掃描的 `已測數/總數`；`progress.jsonl` 同步保存這些事件，可在另一個 terminal 用 `tail -f <輸出目錄>/progress.jsonl` 查看。DNS 與 Web 檢查可同時進行。每個 origin 的 vhost、path、extension 掃描預設依序執行；加入 `--scanner-workers 2` 或 `3` 可同時跑最多 2 或 3 個 `ffuf` 階段。每個 `ffuf` 仍各以 20 requests/s 為上限，因此 2 個 worker 的合計上限是 40 requests/s。`--hosts-file` 的 hostname 仍逐一處理。
@@ -81,6 +81,7 @@ hosts/<hostname>-<hash>/responses/*.headers|*.body|*.meta|*.errors|*.jsonl
 hosts/<hostname>-<hash>/tls/
 hosts/<hostname>-<hash>/dns/
 hosts/<hostname>-<hash>/scanners/
+hosts/<hostname>-<hash>/reused/       重跑時複製的舊證據
 hosts/<hostname>-<hash>/public/
 ```
 

@@ -76,19 +76,23 @@ def _run_stage(reporter: ProgressReporter | None, host: str, stage: str,
 
 
 def _artifact_path(path: str, run_dir: Path) -> str:
+    if not Path(path).is_absolute():
+        return path
     try:
         return str(Path(path).resolve().relative_to(run_dir.resolve()))
     except (ValueError, OSError):
         return path
 
 
-def _relative_artifacts(value, run_dir: Path):
+def _relative_artifacts(value, run_dir: Path, key: str = ""):
     if isinstance(value, list):
-        return [_relative_artifacts(item, run_dir) for item in value]
+        item_key = "artifact" if key == "artifacts" else ""
+        return [_relative_artifacts(item, run_dir, item_key) for item in value]
     if isinstance(value, dict):
-        return {key: _relative_artifacts(item, run_dir) if key not in ("prefix", "artifact", "stdout", "stderr", "meta")
-                else _artifact_path(item, run_dir) if isinstance(item, str) else item
-                for key, item in value.items()}
+        return {name: _relative_artifacts(item, run_dir, name)
+                for name, item in value.items()}
+    if isinstance(value, str) and key in ("prefix", "artifact", "stdout", "stderr", "meta"):
+        return _artifact_path(value, run_dir)
     return value
 
 

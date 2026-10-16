@@ -5,11 +5,14 @@ from pathlib import Path
 from tempfile import mkdtemp
 from threading import Thread
 import json
+import re
 import sys
+from urllib.parse import unquote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from webrecon.cli import main
 from webrecon.fuzz import run_extensions, run_paths, run_vhost
+from webrecon.report import report_existing_run
 
 
 class Site(BaseHTTPRequestHandler):
@@ -70,6 +73,7 @@ try:
                      "--out-dir", str(cli_out)])
     cli_summary = json.loads(next(cli_out.glob("hosts/*/summary.json")).read_text())
     cli_scanners = cli_summary["scanners"]["http"]
+    assert all(not Path(path).is_absolute() for path in cli_scanners["paths"]["artifacts"])
     cli_events = [json.loads(line) for line in (cli_out / "progress.jsonl").read_text().splitlines()]
     rerun_outputs = {}
     for stage, flag, wordlist in (
@@ -107,6 +111,16 @@ try:
     assert combined_summary["rerun"]["stages"] == ["paths", "extensions"]
     assert "filename_rescan" not in combined_summary["scanners"]["http"]["extensions"]
     assert (combined_out / "report.md").is_file()
+    hidden_source = root / "cli-hidden"
+    cli_out.rename(hidden_source)
+    try:
+        report_existing_run(combined_out)
+        for href in re.findall(r"\]\(([^)]+)\)", (combined_out / "report.md").read_text()):
+            target = (combined_out / unquote(href)).resolve()
+            assert target.is_relative_to(combined_out.resolve()), href
+            assert target.is_file(), href
+    finally:
+        hidden_source.rename(cli_out)
     rerun_outputs["paths+extensions"] = {
         "exit_code": combined_code, "status": combined_summary["status"],
         "rerun_status": combined_summary["rerun"]["status"],

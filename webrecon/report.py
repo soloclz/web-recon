@@ -215,7 +215,7 @@ def write_report(run_dir: Path, results: list[dict], source_run: Path | None = N
     if rerun:
         stages = rerun.get("rerun_stages") or ([rerun["rerun_only"]] if rerun.get("rerun_only") else [])
         lines[2:2] = [f"Rerun stages: **{_text(', '.join(stages))}**. "
-                      f"Unchanged stages reuse the saved results in {_text(rerun['reused_from'])}.", ""]
+                      f"Referenced reused evidence is included in this run. Source: {_text(rerun['reused_from'])}.", ""]
     overview = []
     for result in results:
         source_root = _source_root(run_dir, result, source_run)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from pathlib import Path
@@ -64,6 +65,129 @@ def _read_source(source_run: Path) -> tuple[dict, list[dict]]:
             raise ValueError(f"source host summary does not match run.json: {host}")
         summaries.append(_source_evidence_paths(summary, source_run))
     return overview, summaries
+
+
+def _source_roots(source_run: Path) -> list[Path]:
+    """Allow evidence from this run and existing ancestors in its run history."""
+    roots = []
+    seen = set()
+    current = source_run.resolve()
+    while current not in seen and (current / "run.json").is_file():
+        roots.append(current)
+        seen.add(current)
+        try:
+            previous = json.loads((current / "run.json").read_text(encoding="utf-8")).get("source_run")
+        except (OSError, json.JSONDecodeError):
+            break
+        if not isinstance(previous, str) or not previous:
+            break
+        pointer = Path(previous)
+        current = (pointer if pointer.is_absolute() else current / pointer).resolve()
+    return roots
+
+
+def _bundle_evidence(result: dict, run_dir: Path, host_dir: Path,
+                     source_roots: list[Path]) -> dict:
+    """Copy retained raw evidence so the new run can be moved on its own."""
+    host = result["host"]
+    owners: dict[Path, Path] = {}
+
+    def target_for(source: Path) -> Path:
+        for root in source_roots:
+            old_host = _host_dir(root, host).resolve()
+            if not old_host.is_relative_to(root):
+                continue
+            try:
+                relative = source.relative_to(old_host)
+            except ValueError:
+                continue
+            if relative.parts and relative.parts[0] == "reused":
+                return host_dir / relative
+            namespace = f"{root.name[:40]}-{hashlib.sha256(str(root).encode()).hexdigest()[:10]}"
+            return host_dir / "reused" / namespace / relative
+        raise ValueError(f"evidence path is outside the source run history: {source}")
+
+    def copy_file(source: Path) -> Path:
+        source = source.resolve()
+        if not source.is_file():
+            raise ValueError(f"referenced evidence is missing: {source}")
+        target = target_for(source)
+        owner = owners.get(target)
+        if owner is not None:
+            if owner != source:
+                raise ValueError(f"evidence destination collision: {target}")
+            return target
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            raise ValueError(f"evidence destination already exists: {target}")
+        shutil.copy2(source, target)
+        owners[target] = source
+        return target
+
+    def rewrite(value, key: str = ""):
+        if isinstance(value, dict):
+            return {name: rewrite(item, name) for name, item in value.items()}
+        if isinstance(value, list):
+            item_key = "artifact" if key == "artifacts" else ""
+            return [rewrite(item, item_key) for item in value]
+        if not isinstance(value, str) or key not in _EVIDENCE_KEYS:
+            return value
+        source = Path(value)
+        if not source.is_absolute():
+            source = run_dir / source
+        source = source.resolve()
+        if source.is_relative_to(run_dir):
+            return str(source)
+        if key == "prefix":
+            sidecars = sorted(source.parent.glob(source.name + ".*"))
+            if not (source.parent / (source.name + ".body")).is_file():
+                raise ValueError(f"referenced response body is missing: {source}.body")
+            target = target_for(source)
+            for sidecar in sidecars:
+                if sidecar.is_file():
+                    copy_file(sidecar)
+            return str(target)
+        return str(copy_file(source))
+
+    return rewrite(result)
+
+
+def _prune_reused_evidence(result: dict, host_dir: Path) -> None:
+    """Discard copied evidence from stages replaced by this rerun."""
+    reused = host_dir / "reused"
+    if not reused.is_dir():
+        return
+    referenced: set[Path] = set()
+
+    def collect(value, key: str = "") -> None:
+        if isinstance(value, dict):
+            for name, item in value.items():
+                collect(item, name)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item, "artifact" if key == "artifacts" else "")
+        elif isinstance(value, str) and key in _EVIDENCE_KEYS:
+            path = Path(value).resolve()
+            if key == "prefix":
+                referenced.update(item.resolve() for item in path.parent.glob(path.name + ".*")
+                            if item.is_file())
+            else:
+                referenced.add(path)
+
+    collect(result)
+    for path in reused.rglob("*"):
+        if path.is_file() and path.resolve() not in referenced:
+            path.unlink()
+    for directory in sorted((path for path in reused.rglob("*") if path.is_dir()),
+                            key=lambda path: len(path.parts), reverse=True):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+    try:
+        reused.rmdir()
+    except OSError:
+        pass
 
 
 def _previous_paths_wordlist(source_run: Path, overview: dict, result: dict,
@@ -146,11 +270,12 @@ def _merge_filenames(previous: dict, replacement: dict) -> dict:
 
 
 def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
-             options, progress: ProgressReporter) -> dict:
+             options, progress: ProgressReporter, source_roots: list[Path]) -> dict:
     host = result["host"]
     port = result["port"]
     host_dir = _host_dir(run_dir, host)
     host_dir.mkdir(parents=True, exist_ok=False)
+    result = _bundle_evidence(result, run_dir, host_dir, source_roots)
     result["reused_from"] = str(source_run)
     stages = options.rerun_stages
     result["rerun_stages"] = list(stages)
@@ -242,6 +367,7 @@ def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
             result["rerun"]["stage"] = stages[0]
     result["new_hosts"] = _add_candidates(host, result, result.get("resolved_ips", []), port)
     result["status"] = _status(result)
+    _prune_reused_evidence(result, host_dir)
     clean = _relative_artifacts(result, run_dir)
     (host_dir / "summary.json").write_text(
         json.dumps(clean, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -264,12 +390,14 @@ def rerun_main(options) -> int:
                 if label in ("http", "https") and options.paths_wordlist is None:
                     _previous_paths_wordlist(source_run, overview, result, label)
     run_dir = create_run_dir(options.out_dir)
+    source_roots = _source_roots(source_run)
     print(f"Output: {run_dir}", flush=True)
     results = []
     with ProgressReporter(run_dir) as progress:
         for result in summaries:
             print(f"[{result['host']}:{result['port']}] rerun {', '.join(options.rerun_stages)}", flush=True)
-            results.append(_run_one(result, source_run, run_dir, overview, options, progress))
+            results.append(_run_one(result, source_run, run_dir, overview, options, progress,
+                                    source_roots))
     wordlists = dict(overview.get("wordlists") or {})
     for name in ("host_prefixes_wordlist", "paths_wordlist", "extensions_wordlist"):
         path = getattr(options, name)
