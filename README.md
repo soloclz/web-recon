@@ -19,6 +19,8 @@ python3 scripts/web-recon.py --hosts-file hosts.txt --port 443 \
 
 `--paths-wordlist` 由 `ffuf` 掃根路徑，不遞迴。`--extensions-wordlist` 先測 `indexFUZZ` 等已觀察檔名；如找到與 missing baseline 不同的 `.php` response，才用 path 字典測 `FUZZ.php`。`--max-extra-requests` 限制這個第二階段的 request 數，預設 100,000。三種字典可各自省略。
 
+執行開始會印出輸出目錄。終端顯示各階段的開始、完成、耗時，以及 `ffuf` 當次掃描的 `已測數/總數`；`progress.jsonl` 同步保存這些事件，可在另一個 terminal 用 `tail -f <輸出目錄>/progress.jsonl` 查看。DNS 與 Web 檢查可同時進行。每個 origin 的 vhost、path、extension 掃描預設依序執行；加入 `--scanner-workers 2` 或 `3` 可同時跑最多 2 或 3 個 `ffuf` 階段。每個 `ffuf` 仍各以 20 requests/s 為上限，因此 2 個 worker 的合計上限是 40 requests/s。`--hosts-file` 的 hostname 仍逐一處理。
+
 `--public-sources` 才查 crt.sh 與 Wayback CDX；候選 hostname 不會在同一輪自動探測。`.htb` 等內部名稱不送到公共資料來源。當前服務的 TLS certificate SAN 始終檢查。來源、上限與輸出見 [公開資料來源](docs/public-sources.md)。
 
 ## 固定檢查
@@ -35,6 +37,7 @@ python3 scripts/web-recon.py --hosts-file hosts.txt --port 443 \
 
 ```text
 run.json                  批次完成狀態
+progress.jsonl            執行中的階段與 ffuf 進度
 new-hosts.txt             可作下一輪 --hosts-file 輸入的候選 hostname
 new-hosts.jsonl           候選來源、起始 hostname 與起始 host 的實際連線 IP:port
 hosts/<hostname>-<hash>/summary.json

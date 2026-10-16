@@ -1,5 +1,6 @@
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -278,7 +279,7 @@ class FuzzTests(unittest.TestCase):
         def run(argv, **kwargs):
             output = Path(argv[argv.index("-o") + 1])
             output.write_text(json.dumps({"results": []}), encoding="utf-8")
-            return subprocess.CompletedProcess(argv, 0, b":: Errors : 3\n", b"")
+            return subprocess.CompletedProcess(argv, 0, b"", b"\r\x1b[2K:: Progress: [1/1] :: Errors: 3 ::")
 
         with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), patch.object(
             fuzz.subprocess, "run", side_effect=run
@@ -286,6 +287,62 @@ class FuzzTests(unittest.TestCase):
             report = fuzz.run_paths("http://box.htb", names, self.root / "out", baseline=PAIR)
         self.assertEqual(report["status"], "error")
         self.assertTrue(any("3 request errors" in item for item in report["diagnostics"]))
+
+    def test_ffuf_progress_is_reported_before_completion_and_raw_streams_remain(self):
+        names = self.wordlist("paths.txt", "admin\nmissing\n")
+        actual_popen = subprocess.Popen
+        launched = []
+        events = []
+
+        def launch(argv, **kwargs):
+            output = Path(argv[argv.index("-o") + 1])
+            output.write_text(json.dumps({"results": []}), encoding="utf-8")
+            script = (
+                "import os,time; "
+                "os.write(2,b'\\r\\x1b[2K:: Progress: [0/2] :: Errors: 0 ::'); "
+                "time.sleep(.4); "
+                "os.write(2,b'\\r\\x1b[2K:: Progress: [1/2] :: Errors: 0 ::'); "
+                "time.sleep(.4); "
+                "os.write(2,b'\\r\\x1b[2K:: Progress: [2/2] :: Errors: 0 ::'); "
+                "os.write(1,b'raw stdout\\n')"
+            )
+            process = actual_popen([sys.executable, "-c", script], **kwargs)
+            launched.append(process)
+            return process
+
+        def progress(name, done, total):
+            events.append((name, done, total, launched[-1].poll()))
+
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), patch.object(
+            fuzz.subprocess, "Popen", side_effect=launch
+        ):
+            report = fuzz.run_paths("http://box.htb", names, self.root / "out", baseline=PAIR, progress=progress)
+        self.assertEqual(report["status"], "completed")
+        self.assertTrue(any(name == "paths" and done == 0 and total == 2 and state is None
+                            for name, done, total, state in events))
+        self.assertEqual(events[-1][:3], ("paths", 2, 2))
+        self.assertEqual((self.root / "out" / "paths.stdout").read_bytes(), b"raw stdout\n")
+        self.assertIn(b"Progress: [2/2]", (self.root / "out" / "paths.stderr").read_bytes())
+
+    def test_streaming_ffuf_timeout_retains_partial_streams(self):
+        names = self.wordlist("paths.txt", "admin\n")
+        actual_popen = subprocess.Popen
+
+        def launch(argv, **kwargs):
+            output = Path(argv[argv.index("-o") + 1])
+            output.write_text(json.dumps({"results": []}), encoding="utf-8")
+            script = "import os,time; os.write(2,b':: Progress: [0/1]'); time.sleep(5)"
+            return actual_popen([sys.executable, "-c", script], **kwargs)
+
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), patch.object(
+            fuzz.subprocess, "Popen", side_effect=launch
+        ), patch.object(fuzz, "TIMEOUT", 0.1):
+            report = fuzz.run_paths("http://box.htb", names, self.root / "out", baseline=PAIR,
+                                    progress=lambda *args: None)
+        self.assertEqual(report["status"], "error")
+        self.assertTrue(any("timed out" in message for message in report["diagnostics"]))
+        self.assertEqual(json.loads((self.root / "out" / "paths.status.json").read_text())["returncode"], None)
+        self.assertIn(b"Progress: [0/1]", (self.root / "out" / "paths.stderr").read_bytes())
 
 
 if __name__ == "__main__":

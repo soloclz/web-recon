@@ -14,7 +14,9 @@ import secrets
 import shutil
 import ssl
 import subprocess
+import time
 from pathlib import Path
+from typing import Callable
 from urllib.parse import quote, urlsplit
 
 
@@ -23,6 +25,7 @@ TIMEOUT = 60 * 60
 BODY_LIMIT = 1024 * 1024
 MAX_BASENAMES = 25
 _LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+_FFUF_PROGRESS = re.compile(rb":: Progress: \[(\d+)/(\d+)\]")
 
 
 def _report(status: str, **more: object) -> dict:
@@ -154,7 +157,54 @@ def _extension_assessment(hit: dict, controls: list[dict]) -> str:
     return _assessment(hit, controls)
 
 
-def _scan(out_dir: Path, name: str, wordlist: Path, url: str, *, host_header: str | None = None) -> tuple[list[dict], list[str], list[str], str]:
+def _run_with_progress(
+    args: list[str], name: str, stdout: Path, stderr: Path,
+    progress: Callable[[str, int, int], None],
+) -> tuple[int | None, bool]:
+    """Keep ffuf's raw streams and report the latest counter while it runs."""
+    timed_out = False
+    with stdout.open("wb") as stdout_file, stderr.open("wb") as stderr_file:
+        process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=stdout_file, stderr=stderr_file)
+        try:
+            with stderr.open("rb") as progress_file:
+                deadline = time.monotonic() + TIMEOUT
+                tail = b""
+                last_count: tuple[int, int] | None = None
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if process.poll() is None and remaining > 0:
+                        try:
+                            process.wait(timeout=min(0.25, remaining))
+                        except subprocess.TimeoutExpired:
+                            pass
+                    elif process.poll() is None:
+                        process.kill()
+                        process.wait()
+                        timed_out = True
+                    chunk = progress_file.read()
+                    if chunk:
+                        data = tail + chunk
+                        matches = _FFUF_PROGRESS.findall(data)
+                        if matches:
+                            count = tuple(map(int, matches[-1]))
+                            if count != last_count:
+                                progress(name, *count)
+                                last_count = count
+                        tail = data[-64:]
+                    if process.poll() is not None:
+                        break
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+    return (None if timed_out else process.returncode), timed_out
+
+
+def _scan(
+    out_dir: Path, name: str, wordlist: Path, url: str, *,
+    host_header: str | None = None,
+    progress: Callable[[str, int, int], None] | None = None,
+) -> tuple[list[dict], list[str], list[str], str]:
     output = out_dir / f"{name}.json"
     stdout = out_dir / f"{name}.stdout"
     stderr = out_dir / f"{name}.stderr"
@@ -168,10 +218,15 @@ def _scan(out_dir: Path, name: str, wordlist: Path, url: str, *, host_header: st
     artifacts = [str(stdout), str(stderr), str(status_path)]
     diagnostics: list[str] = []
     try:
-        completed = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=TIMEOUT, check=False)
-        stdout.write_bytes(completed.stdout)
-        stderr.write_bytes(completed.stderr)
-        returncode = completed.returncode
+        if progress is None:
+            completed = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=TIMEOUT, check=False)
+            stdout.write_bytes(completed.stdout)
+            stderr.write_bytes(completed.stderr)
+            returncode = completed.returncode
+        else:
+            returncode, timed_out = _run_with_progress(args, name, stdout, stderr, progress)
+            if timed_out:
+                diagnostics.append(f"{name}: ffuf timed out after {TIMEOUT} seconds")
     except OSError as exc:
         stdout.write_bytes(b"")
         stderr.write_text(f"{type(exc).__name__}: {exc}\n", encoding="utf-8")
@@ -199,8 +254,8 @@ def _scan(out_dir: Path, name: str, wordlist: Path, url: str, *, host_header: st
     if returncode != 0:
         diagnostics.append(f"{name}: ffuf exited with status {returncode}; partial results retained")
         return hits, artifacts, diagnostics, "error"
-    output_text = stdout.read_text(encoding="utf-8", errors="replace")
-    error_counts = [int(value) for value in re.findall(r"\bErrors\s*:\s*(\d+)", output_text)]
+    error_text = stderr.read_text(encoding="utf-8", errors="replace")
+    error_counts = [int(value) for value in re.findall(r"\bErrors\s*:\s*(\d+)", error_text)]
     if error_counts and max(error_counts) > 0:
         diagnostics.append(f"{name}: ffuf reported {max(error_counts)} request errors; partial results retained")
         return hits, artifacts, diagnostics, "error"
@@ -256,7 +311,10 @@ def _wordlist_check(wordlist: Path | None) -> str | None:
     return None
 
 
-def run_vhost(origin: str, host: str, wordlist: Path | None, out_dir: Path) -> dict:
+def run_vhost(
+    origin: str, host: str, wordlist: Path | None, out_dir: Path, *,
+    progress: Callable[[str, int, int], None] | None = None,
+) -> dict:
     """Fuzz only prefixes of the supplied hostname using HTTP Host."""
     if wordlist is None:
         return _report("not_run")
@@ -273,7 +331,9 @@ def run_vhost(origin: str, host: str, wordlist: Path | None, out_dir: Path) -> d
     if not _hostname(host):
         return _report("error", diagnostics=["invalid input hostname"])
     controls, artifacts, diagnostics = _save_controls(origin, out_dir, "vhost", host)
-    hits, scan_artifacts, scan_diagnostics, status = _scan(out_dir, "vhost", wordlist, f"{origin}/", host_header=f"FUZZ.{host}")
+    hits, scan_artifacts, scan_diagnostics, status = _scan(
+        out_dir, "vhost", wordlist, f"{origin}/", host_header=f"FUZZ.{host}", progress=progress
+    )
     artifacts.extend(scan_artifacts)
     diagnostics.extend(scan_diagnostics)
     candidates = []
@@ -302,7 +362,10 @@ def run_vhost(origin: str, host: str, wordlist: Path | None, out_dir: Path) -> d
     return _report(status, candidates=candidates, uncertain_hits=uncertain_hits, artifacts=artifacts, diagnostics=diagnostics, controls=controls)
 
 
-def run_paths(origin: str, wordlist: Path | None, out_dir: Path, baseline: dict | None = None) -> dict:
+def run_paths(
+    origin: str, wordlist: Path | None, out_dir: Path, baseline: dict | None = None, *,
+    progress: Callable[[str, int, int], None] | None = None,
+) -> dict:
     """Scan the origin root without recursion."""
     if wordlist is None:
         return _report("not_run")
@@ -321,7 +384,9 @@ def run_paths(origin: str, wordlist: Path | None, out_dir: Path, baseline: dict 
     diagnostics: list[str] = []
     if not _stable_control_pair(controls):
         controls, artifacts, diagnostics = _save_controls(origin, out_dir, "path")
-    hits, scan_artifacts, scan_diagnostics, status = _scan(out_dir, "paths", wordlist, f"{origin}/FUZZ")
+    hits, scan_artifacts, scan_diagnostics, status = _scan(
+        out_dir, "paths", wordlist, f"{origin}/FUZZ", progress=progress
+    )
     artifacts.extend(scan_artifacts)
     diagnostics.extend(scan_diagnostics)
     candidates = []
@@ -404,6 +469,8 @@ def run_extensions(
     out_dir: Path,
     max_extra_requests: int = 100000,
     baseline: dict | None = None,
+    *,
+    progress: Callable[[str, int, int], None] | None = None,
 ) -> dict:
     """Try known stems with extension words, then bounded names with observed extensions."""
     if ext_wordlist is None:
@@ -452,7 +519,7 @@ def run_extensions(
     status = "completed"
     for index, stem in enumerate(stems, 1):
         hits, new_artifacts, new_diagnostics, scan_status = _scan(
-            out_dir, f"extension-stem-{index}", normalized, f"{origin}/{stem}FUZZ"
+            out_dir, f"extension-stem-{index}", normalized, f"{origin}/{stem}FUZZ", progress=progress
         )
         artifacts.extend(new_artifacts)
         diagnostics.extend(new_diagnostics)
@@ -507,7 +574,8 @@ def run_extensions(
                     continue
                 request_count += count
                 hits, new_artifacts, new_diagnostics, scan_status = _scan(
-                    out_dir, f"extension-filenames-{index}", limited, f"{origin}/FUZZ{extension}"
+                    out_dir, f"extension-filenames-{index}", limited, f"{origin}/FUZZ{extension}",
+                    progress=progress,
                 )
                 artifacts.extend(new_artifacts)
                 diagnostics.extend(new_diagnostics)

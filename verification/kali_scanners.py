@@ -8,6 +8,7 @@ import json
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from webrecon.cli import main
 from webrecon.fuzz import run_extensions, run_paths, run_vhost
 
 
@@ -50,9 +51,26 @@ server = ThreadingHTTPServer(("127.0.0.1", 0), Site)
 Thread(target=server.serve_forever, daemon=True).start()
 try:
     origin = f"http://127.0.0.1:{server.server_port}"
-    vhost = run_vhost(origin, "localhost", prefixes, root / "vhost")
-    path_scan = run_paths(origin, paths, root / "paths")
-    ext_scan = run_extensions(origin, paths, extensions, ["index"], root / "extensions", 2)
+    scan_progress = []
+
+    def record_progress(name, current, total):
+        scan_progress.append((name, current, total))
+
+    vhost = run_vhost(origin, "localhost", prefixes, root / "vhost", progress=record_progress)
+    path_scan = run_paths(origin, paths, root / "paths", progress=record_progress)
+    ext_scan = run_extensions(origin, paths, extensions, ["index"], root / "extensions", 2,
+                              progress=record_progress)
+    cli_out = root / "cli"
+    cli_exit = main(["--host", "localhost", "--port", str(server.server_port),
+                     "--host-prefixes-wordlist", str(prefixes),
+                     "--paths-wordlist", str(paths),
+                     "--extensions-wordlist", str(extensions),
+                     "--scanner-workers", "2", "--max-extra-requests", "2",
+                     "--max-pages", "5", "--max-requests", "100",
+                     "--out-dir", str(cli_out)])
+    cli_summary = json.loads(next(cli_out.glob("hosts/*/summary.json")).read_text())
+    cli_scanners = cli_summary["scanners"]["http"]
+    cli_events = [json.loads(line) for line in (cli_out / "progress.jsonl").read_text().splitlines()]
     evidence = {
         "fixture_port": server.server_port,
         "vhost": {"status": vhost["status"], "candidates": vhost["candidates"],
@@ -63,6 +81,10 @@ try:
                        "confirmed_extensions": ext_scan["confirmed_extensions"],
                        "extra_request_count": ext_scan["extra_request_count"],
                        "diagnostics": ext_scan["diagnostics"]},
+        "progress": {name: [current, total] for name, current, total in scan_progress},
+        "cli": {"exit_code": cli_exit, "status": cli_summary["status"],
+                "scanner_status": {name: stage["status"] for name, stage in cli_scanners.items()},
+                "progress_events": len(cli_events)},
     }
     (root / "verification.json").write_text(json.dumps(evidence, indent=2) + "\n")
     print(root)
@@ -76,5 +98,15 @@ try:
     assert any(x["url"].endswith("/admin.php") and x["phase"] == "known_extension"
                for x in ext_scan["candidates"])
     assert ext_scan["extra_request_count"] == 2
+    assert {"vhost", "paths", "extension-stem-1", "extension-filenames-1"}.issubset(
+        evidence["progress"]
+    )
+    assert cli_exit in (0, 1) and cli_summary["dns"]["status"] in {"partial", "unavailable", "completed"}
+    assert all(stage["status"] == "completed" for stage in cli_scanners.values())
+    assert any(x["hostname"] == "admin.localhost" for x in cli_scanners["vhost"]["candidates"])
+    assert any(x["url"].endswith("/admin") for x in cli_scanners["paths"]["candidates"])
+    assert any(x["url"].endswith("/admin.php") for x in cli_scanners["extensions"]["candidates"])
+    assert any(item["stage"] == "scanner:http:vhost" and item["event"] == "progress"
+               for item in cli_events)
 finally:
     server.shutdown()

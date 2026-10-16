@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from threading import Event
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
@@ -199,6 +200,57 @@ class HttpCliTests(unittest.TestCase):
                       if "missing.htb" in path.parent.name)
         self.assertEqual(failed["stages"]["resolution"]["status"], "error")
         self.assertTrue((out_dir / "new-hosts.txt").is_file())
+        events = [json.loads(line) for line in (out_dir / "progress.jsonl").read_text().splitlines()]
+        self.assertTrue(any(item["host"] == "missing.htb" and item["stage"] == "resolution"
+                            and item["event"] == "finish" and item["status"] == "error"
+                            for item in events))
+        self.assertTrue(any(item["host"] == "good.htb" and item["stage"] == "scanner:http:paths"
+                            and item["event"] == "finish" for item in events))
+
+    def test_dns_overlaps_web_and_two_scanners_can_overlap(self):
+        out_dir = self.root / "parallel-run"
+        dns_started = Event()
+        web_started = Event()
+        vhost_started = Event()
+        paths_started = Event()
+
+        def dns(*_):
+            dns_started.set()
+            return {"status": "completed", "candidates": []} if web_started.wait(2) else {"status": "error"}
+
+        def probe(host, port, _client):
+            web_started.set()
+            origin = f"http://{host}:{port}"
+            return {"status": "completed", "probes": {"http": {"usable": True}},
+                    "origins": [(origin, make_response(origin + "/"))]}
+
+        def vhost(*_, progress=None):
+            vhost_started.set()
+            if progress is not None:
+                progress("vhost", 1, 2)
+                progress("vhost", 2, 2)
+            return {"status": "completed", "candidates": []} if paths_started.wait(2) else {"status": "error"}
+
+        def paths(*_, progress=None):
+            paths_started.set()
+            return {"status": "completed", "candidates": []} if vhost_started.wait(2) else {"status": "error"}
+
+        with patch.object(cli, "resolve_host", return_value=["192.0.2.5"]), \
+             patch.object(cli, "run_dns", side_effect=dns), \
+             patch.object(cli, "probe_origins", side_effect=probe), \
+             patch.object(cli, "get_tls_certificate", return_value={"status": "completed", "san": []}), \
+             patch.object(cli, "inspect_origin", return_value={"status": "completed", "pages": []}), \
+             patch.object(cli, "run_vhost", side_effect=vhost), \
+             patch.object(cli, "run_paths", side_effect=paths), \
+             patch.object(cli, "run_extensions", return_value={"status": "not_run"}):
+            exit_code = cli.main(["--host", "box.htb", "--port", "8080",
+                                  "--out-dir", str(out_dir), "--scanner-workers", "2"])
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(dns_started.is_set() and web_started.is_set())
+        self.assertTrue(vhost_started.is_set() and paths_started.is_set())
+        events = [json.loads(line) for line in (out_dir / "progress.jsonl").read_text().splitlines()]
+        self.assertTrue(any(item.get("scan") == "vhost" and item.get("current") == 2
+                            and item.get("total") == 2 for item in events))
 
 
     def test_malformed_link_form_action_and_query_script_map(self):

@@ -8,6 +8,7 @@ import json
 import re
 import socket
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -16,6 +17,7 @@ from .dns import run_dns
 from .fuzz import run_extensions, run_paths, run_vhost
 from .http import HttpClient, get_tls_certificate, inspect_origin, probe_origins
 from .public import run_public_sources
+from .progress import ProgressReporter
 
 _HOST_RE = re.compile(r"(?=.{1,253}\Z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 
@@ -61,6 +63,16 @@ def _safe_call(func, *args, **kwargs) -> dict:
         return func(*args, **kwargs)
     except Exception as exc:
         return {"status": "error", "diagnostics": [f"{type(exc).__name__}: {exc}"]}
+
+
+def _run_stage(reporter: ProgressReporter | None, host: str, stage: str,
+               func, *args, **kwargs) -> dict:
+    if reporter is not None:
+        reporter.start(host, stage)
+    result = _safe_call(func, *args, **kwargs)
+    if reporter is not None:
+        reporter.finish(host, stage, result.get("status", "error"))
+    return result
 
 
 def _artifact_path(path: str, run_dir: Path) -> str:
@@ -130,42 +142,79 @@ def _observed_basenames(web: dict) -> list[str]:
     return sorted(names)[:30]
 
 
-def run_host(host: str, port: int, run_dir: Path, options: argparse.Namespace) -> dict:
+def run_host(host: str, port: int, run_dir: Path, options: argparse.Namespace,
+             progress: ProgressReporter | None = None) -> dict:
     slug = hashlib.sha256(host.encode("utf-8")).hexdigest()[:10]
     host_dir = run_dir / "hosts" / f"{host[:80]}-{slug}"
     host_dir.mkdir(parents=True, exist_ok=False)
     result: dict = {"host": host, "port": port, "status": "error", "resolved_ips": [],
                     "stages": {}, "web": {}, "scanners": {}, "new_hosts": []}
+    if progress is not None:
+        progress.start(host, "resolution")
     try:
         ips = resolve_host(host, port)
     except OSError as exc:
+        if progress is not None:
+            progress.finish(host, "resolution", "error")
         result["stages"]["resolution"] = {"status": "error", "diagnostics": [str(exc)]}
         (host_dir / "summary.json").write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         return result
+    if progress is not None:
+        progress.finish(host, "resolution", "completed")
     result["resolved_ips"] = ips
     result["stages"]["resolution"] = {"status": "completed", "addresses": ips}
     summary_script = Path(__file__).resolve().parents[1] / "scripts" / "web-summary.py"
     client = HttpClient(host_dir / "responses", summary_script, options.max_body_bytes, options.max_requests)
-    scheme = _safe_call(probe_origins, host, port, client)
-    result["stages"]["scheme"] = {key: value for key, value in scheme.items() if key != "origins"}
-    result["tls"] = _safe_call(get_tls_certificate, host, port, host_dir / "tls")
-    result["dns"] = _safe_call(run_dns, host, ips, options.host_prefixes_wordlist, host_dir / "dns")
-    result["stages"]["dns"] = {"status": result["dns"]["status"]}
-    for origin, root in scheme.get("origins", []):
-        label = urlsplit(origin).scheme
-        web = _safe_call(inspect_origin, origin, root, client, options.max_pages, options.max_depth)
-        result["web"][label] = web
-        scanner_dir = host_dir / "scanners" / label
-        scanner_dir.mkdir(parents=True, exist_ok=True)
-        result["scanners"][label] = {
-            "vhost": _safe_call(run_vhost, origin, host, options.host_prefixes_wordlist, scanner_dir / "vhost"),
-            "paths": _safe_call(run_paths, origin, options.paths_wordlist, scanner_dir / "paths"),
-            "extensions": _safe_call(run_extensions, origin, options.paths_wordlist,
-                                      options.extensions_wordlist, _observed_basenames(web),
-                                      scanner_dir / "extensions", options.max_extra_requests),
-        }
-    result["public_sources"] = (_safe_call(run_public_sources, host, host_dir / "public")
-                                if options.public_sources else {"status": "not_run"})
+    with ThreadPoolExecutor(max_workers=1) as dns_pool:
+        dns_future = dns_pool.submit(_run_stage, progress, host, "dns", run_dns,
+                                     host, ips, options.host_prefixes_wordlist, host_dir / "dns")
+        scheme = _run_stage(progress, host, "scheme", probe_origins, host, port, client)
+        result["stages"]["scheme"] = {key: value for key, value in scheme.items() if key != "origins"}
+        result["tls"] = _run_stage(progress, host, "tls", get_tls_certificate,
+                                    host, port, host_dir / "tls")
+        for origin, root in scheme.get("origins", []):
+            label = urlsplit(origin).scheme
+            web = _run_stage(progress, host, f"web:{label}", inspect_origin,
+                             origin, root, client, options.max_pages, options.max_depth)
+            result["web"][label] = web
+            scanner_dir = host_dir / "scanners" / label
+            scanner_dir.mkdir(parents=True, exist_ok=True)
+            scan_specs = [
+                ("vhost", run_vhost, (origin, host, options.host_prefixes_wordlist,
+                                      scanner_dir / "vhost")),
+                ("paths", run_paths, (origin, options.paths_wordlist,
+                                      scanner_dir / "paths")),
+                ("extensions", run_extensions,
+                 (origin, options.paths_wordlist, options.extensions_wordlist,
+                  _observed_basenames(web), scanner_dir / "extensions",
+                  options.max_extra_requests)),
+            ]
+
+            def scan_one(name, function, args):
+                stage = f"scanner:{label}:{name}"
+                callback = (lambda scan, current, total:
+                            progress.update(host, stage, scan, current, total)) if progress else None
+                return _run_stage(progress, host, stage, function, *args, progress=callback)
+
+            scanner_results = {}
+            workers = getattr(options, "scanner_workers", 1)
+            if workers == 1:
+                for name, function, args in scan_specs:
+                    scanner_results[name] = scan_one(name, function, args)
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as scan_pool:
+                    futures = {scan_pool.submit(scan_one, name, function, args): name
+                               for name, function, args in scan_specs}
+                    for future in as_completed(futures):
+                        scanner_results[futures[future]] = future.result()
+            result["scanners"][label] = {
+                name: scanner_results[name] for name, _, _ in scan_specs
+            }
+        result["public_sources"] = (_run_stage(progress, host, "public", run_public_sources,
+                                                host, host_dir / "public")
+                                    if options.public_sources else {"status": "not_run"})
+        result["dns"] = dns_future.result()
+        result["stages"]["dns"] = {"status": result["dns"]["status"]}
     result["new_hosts"] = _add_candidates(host, result, ips, port)
     result["request_count"] = client.request_count
     if scheme.get("status") != "completed":
@@ -214,6 +263,8 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--max-body-bytes", type=int, default=1024 * 1024)
     ap.add_argument("--max-requests", type=int, default=200)
     ap.add_argument("--max-extra-requests", type=int, default=100000)
+    ap.add_argument("--scanner-workers", type=int, default=1,
+                    help="parallel ffuf stages per origin (1-3; each keeps its own 20 req/s cap)")
     return ap
 
 
@@ -224,6 +275,8 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--port must be between 1 and 65535")
     if args.max_pages < 1 or args.max_depth < 0 or args.max_body_bytes < 1024 or args.max_requests < 4 or args.max_extra_requests < 0:
         ap.error("request and crawl limits are invalid")
+    if not 1 <= args.scanner_workers <= 3:
+        ap.error("--scanner-workers must be between 1 and 3")
     for name in ("host_prefixes_wordlist", "paths_wordlist", "extensions_wordlist"):
         path = getattr(args, name)
         if path is not None and not path.is_file():
@@ -233,10 +286,12 @@ def main(argv: list[str] | None = None) -> int:
         run_dir = create_run_dir(args.out_dir)
     except (OSError, ValueError, RuntimeError) as exc:
         ap.error(str(exc))
+    print(f"Output: {run_dir}", flush=True)
     results = []
-    for host in hosts:
-        print(f"[{host}:{args.port}]", flush=True)
-        results.append(run_host(host, args.port, run_dir, args))
+    with ProgressReporter(run_dir) as progress:
+        for host in hosts:
+            print(f"[{host}:{args.port}]", flush=True)
+            results.append(run_host(host, args.port, run_dir, args, progress))
     new_hosts: dict[str, dict] = {}
     for result in results:
         for entry in result.get("new_hosts", []):
