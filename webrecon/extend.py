@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 
 from . import cli, rerun
@@ -231,6 +232,24 @@ def _keep_failed_attempt(previous: dict, attempt: dict, source_run: Path,
     (attempt_dir / "summary.json").write_text(
         json.dumps(cli._relative_artifacts(attempt, attempt_dir), indent=2,
                    ensure_ascii=False) + "\n", encoding="utf-8")
+    if full_scan and (attempt.get("stages") or {}).get("resolution", {}).get("status") == "completed":
+        kept["resolved_ips"] = deepcopy(attempt.get("resolved_ips", []))
+        kept.setdefault("stages", {})["resolution"] = deepcopy(attempt["stages"]["resolution"])
+        if not (kept.get("web") and
+                kept["stages"].get("scheme", {}).get("status") == "completed"):
+            if "scheme" in attempt["stages"]:
+                kept["stages"]["scheme"] = deepcopy(attempt["stages"]["scheme"])
+            if "tls" in attempt:
+                kept["tls"] = deepcopy(attempt["tls"])
+            kept["request_count"] = attempt.get("request_count", kept.get("request_count", 0))
+        if (attempt.get("dns") or {}).get("status") == "completed":
+            kept["dns"] = deepcopy(attempt["dns"])
+            kept["stages"]["dns"] = deepcopy(
+                attempt["stages"].get("dns", {"status": "completed"}))
+            kept.setdefault("scan_settings", {})["dns_server"] = (
+                (attempt.get("scan_settings") or {}).get("dns_server"))
+        kept["new_hosts"] = cli._add_candidates(host, kept, kept["resolved_ips"], kept["port"])
+        kept["status"] = rerun._status(kept)
     kept["action"] = "retry_failed"
     kept["retry"] = {"status": attempt.get("rerun", {}).get("status", attempt.get("status")),
                      "summary": str(attempt_dir / "summary.json"),
@@ -272,14 +291,27 @@ def extend_main(options) -> int:
         wordlist_hashes["extension_names_wordlist"] = current_hashes["extension_names_wordlist"]
     source_results = {result["host"]: result for result in summaries}
     new_hosts = [host for host in requested if host not in source_results]
+    requested_hosts = set(requested)
     plans = {}
+    changes_by_host = {}
     for result in summaries:
         host = result["host"]
+        deferred = result.get("deferred_stages") or []
+        if not isinstance(deferred, list) or any(stage not in _WORDLIST_STAGES.values()
+                                                   for stage in deferred):
+            raise ValueError(f"source host has invalid deferred stages: {host}")
+        host_changes = tuple(dict.fromkeys((*deferred, *changed_stages)))
+        changes_by_host[host] = host_changes
+        if host not in requested_hosts:
+            if host_changes:
+                result["deferred_stages"] = list(host_changes)
+            plans[host] = ("reuse", ())
+            continue
         retry = result.get("retry") or {}
         if retry.get("full_scan") or not _base_ready(result, options):
             plans[host] = ("scan", ())
         else:
-            needed = set(changed_stages) | _failed_wordlist_stages(result, options)
+            needed = set(host_changes) | _failed_wordlist_stages(result, options)
             needed.update(stage for stage in retry.get("stages", ())
                           if stage in (*_WORDLIST_STAGES.values(), "dns", "public"))
             saved_dns_server = (result.get("scan_settings") or {}).get(
@@ -333,7 +365,7 @@ def extend_main(options) -> int:
                 options.rerun_stages = stages
                 pending = (source_results[host].get("retry") or {}).get("prefix_components") or ()
                 options.rerun_dns_words, options.rerun_vhost = _prefix_components(
-                    source_results[host], options, changed_stages, tuple(pending))
+                    source_results[host], options, changes_by_host[host], tuple(pending))
                 if "dns" in stages:
                     options.rerun_dns_words = False
                 updated = rerun._run_one(source_results[host], source_run, run_dir,
@@ -346,6 +378,7 @@ def extend_main(options) -> int:
                                ensure_ascii=False) + "\n", encoding="utf-8")
                 if updated.get("rerun", {}).get("status") == "completed":
                     updated.pop("retry", None)
+                    updated.pop("deferred_stages", None)
                     rerun._prune_reused_evidence(updated, host_dir)
                     (host_dir / "summary.json").write_text(
                         json.dumps(cli._relative_artifacts(updated, run_dir), indent=2,

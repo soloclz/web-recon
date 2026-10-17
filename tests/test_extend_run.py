@@ -201,6 +201,48 @@ class ExtendRunTests(unittest.TestCase):
             self.assertEqual((relocated / f"{prefix}.body").read_text(), "saved response")
             self.assertEqual((relocated / artifact).read_text(), "saved scanner output")
 
+    def test_only_requested_host_runs_and_other_host_defers_new_wordlist(self):
+        overview = fixture_overview(self.source)
+        overview["hosts"] = [entry for entry in overview["hosts"]
+                             if entry["host"] in {self.old, self.failed}]
+        save_fixture_report(self.source, overview)
+        words = self.root / "prefixes.txt"
+        words.write_text("ftp\n")
+        first = self.root / "selected-host"
+        scanned = []
+
+        def scan(host, port, run_dir, options, progress):
+            scanned.append(host)
+            return self._scan_host(host, port, run_dir, options, progress)
+
+        with patch.object(cli, "run_host", side_effect=scan):
+            self.assertEqual(self._run_cli(["--extend-run", str(self.source),
+                                            "--host", self.failed,
+                                            "--host-prefixes-wordlist", str(words),
+                                            "--out-dir", str(first)]), 0)
+        self.assertEqual(scanned, [self.failed])
+        prior = next(item for item in load_report(first)["hosts"]
+                     if item["host"] == self.old)
+        self.assertEqual(prior["action"], "reused")
+        self.assertEqual(prior["deferred_stages"], ["prefixes"])
+
+        second = self.root / "deferred-prefixes"
+        dns_result = {"status": "completed", "records": {}, "candidates": [],
+                      "scanner": {"status": "completed"}}
+        with patch.object(cli, "run_host", side_effect=AssertionError("full scan repeated")), \
+             patch.object(rerun, "rerun_dns_words", return_value=dns_result) as dns_scan, \
+             patch.object(rerun, "run_vhost",
+                          return_value={"status": "completed", "candidates": []}) as vhost_scan:
+            self.assertEqual(self._run_cli(["--extend-run", str(first),
+                                            "--host", self.old,
+                                            "--out-dir", str(second)]), 0)
+        dns_scan.assert_called_once()
+        vhost_scan.assert_called_once()
+        updated = next(item for item in load_report(second)["hosts"]
+                       if item["host"] == self.old)
+        self.assertEqual(updated["action"], "updated")
+        self.assertNotIn("deferred_stages", updated)
+
     def test_mismatched_port_rejected_before_creating_output(self):
         output = self.root / "unused"
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -704,6 +746,97 @@ class ExtendRunTests(unittest.TestCase):
         self.assertEqual((output / (kept["web"]["http"]["pages"][0]["prefix"] + ".body"))
                          .read_text(), "saved response")
         self.assertIn("retry", json.loads((output / "report.json").read_text())["hosts"][0])
+
+    def test_failed_web_retry_keeps_new_dns_and_saved_web(self):
+        self._keep_only_old()
+        source_summary_path = rerun._host_dir(self.source, self.old) / "summary.json"
+        original = json.loads(source_summary_path.read_text())
+        original["status"] = "partial"
+        original["dns"]["status"] = "unavailable"
+        original["stages"]["dns"] = {"status": "unavailable"}
+        original["retry"] = {"full_scan": True}
+        source_summary_path.write_text(json.dumps(original))
+        candidate = "next.old.example.test"
+
+        def failed_web_scan(host, port, run_dir, options, progress):
+            result = self._scan_host(host, port, run_dir, options, progress)
+            artifact = rerun._host_dir(run_dir, host) / "dns" / "axfr.stdout.txt"
+            artifact.parent.mkdir()
+            artifact.write_text("zone transfer evidence")
+            result["resolved_ips"] = ["192.0.2.30"]
+            result["stages"]["resolution"] = {"status": "completed", "addresses": ["192.0.2.30"]}
+            result["stages"]["scheme"] = {"status": "unavailable"}
+            result["stages"]["dns"] = {"status": "completed"}
+            result["dns"].update(candidates=[{"name": candidate, "source": "dns_axfr",
+                                              "addresses": ["192.0.2.31"]}],
+                                 artifacts=[str(artifact)],
+                                 resolver={"mode": "explicit", "address": "192.0.2.53"})
+            result["web"] = {}
+            result["scanners"] = {}
+            result["status"] = "unavailable"
+            (rerun._host_dir(run_dir, host) / "summary.json").write_text(json.dumps(result))
+            return result
+
+        output = self.root / "failed-web-with-new-dns"
+        with patch.object(cli, "run_host", side_effect=failed_web_scan):
+            code = self._run_cli(["--extend-run", str(self.source), "--host", self.old,
+                                  "--dns-server", "192.0.2.53", "--out-dir", str(output)])
+        self.assertEqual(code, 1)
+        saved = load_report(output)
+        host = saved["hosts"][0]
+        self.assertEqual(host["action"], "retry_failed")
+        self.assertEqual(host["dns"]["status"], "completed")
+        self.assertEqual(host["dns"]["resolver"]["address"], "192.0.2.53")
+        self.assertEqual(host["resolved_ips"], ["192.0.2.30"])
+        self.assertEqual(host["stages"]["dns"]["status"], "completed")
+        self.assertEqual(host["scan_settings"]["dns_server"], "192.0.2.53")
+        self.assertEqual(host["web"]["http"]["pages"][0]["title"], "Saved")
+        self.assertEqual(saved["new_hosts"][0]["name"], candidate)
+        self.assertEqual(saved["new_hosts"][0]["observations"][0]["dns_addresses"],
+                         ["192.0.2.31"])
+        self.assertTrue((output / host["dns"]["artifacts"][0]).is_file())
+        self.assertTrue((output / host["retry"]["summary"]).is_file())
+
+    def test_repeated_failed_web_retry_keeps_new_dns_from_previous_attempt(self):
+        overview = fixture_overview(self.source)
+        overview["hosts"] = [entry for entry in overview["hosts"]
+                             if entry["host"] == self.failed]
+        save_fixture_report(self.source, overview)
+        candidate = "next.failed.example.test"
+        attempts = []
+
+        def failed_web_scan(host, port, run_dir, options, progress):
+            result = self._scan_host(host, port, run_dir, options, progress)
+            attempts.append(run_dir)
+            result["resolved_ips"] = ["192.0.2.30"]
+            result["stages"]["resolution"] = {"status": "completed", "addresses": ["192.0.2.30"]}
+            result["stages"]["scheme"] = {"status": "unavailable"}
+            result["stages"]["dns"] = {"status": "completed" if len(attempts) == 1 else "error"}
+            result["dns"]["status"] = result["stages"]["dns"]["status"]
+            result["dns"]["candidates"] = ([{"name": candidate, "source": "dns_axfr"}]
+                                             if len(attempts) == 1 else [])
+            result["web"] = {}
+            result["scanners"] = {}
+            result["status"] = "unavailable"
+            (rerun._host_dir(run_dir, host) / "summary.json").write_text(json.dumps(result))
+            return result
+
+        first = self.root / "first-web-failure"
+        second = self.root / "second-web-failure"
+        with patch.object(cli, "run_host", side_effect=failed_web_scan):
+            self.assertEqual(self._run_cli(["--extend-run", str(self.source),
+                                            "--host", self.failed, "--out-dir", str(first)]), 1)
+            first_host = load_report(first)["hosts"][0]
+            self.assertEqual(first_host["stages"]["resolution"]["status"], "completed")
+            self.assertEqual(first_host["dns"]["status"], "completed")
+            self.assertEqual(first_host["status"], "unavailable")
+            self.assertEqual(load_report(first)["new_hosts"][0]["name"], candidate)
+            self.assertEqual(self._run_cli(["--extend-run", str(first),
+                                            "--host", self.failed, "--out-dir", str(second)]), 1)
+        second_host = load_report(second)["hosts"][0]
+        self.assertEqual(second_host["dns"]["status"], "completed")
+        self.assertEqual(load_report(second)["new_hosts"][0]["name"], candidate)
+        self.assertTrue((second / second_host["retry"]["summary"]).is_file())
 
     def test_failed_path_update_keeps_prior_result(self):
         overview = self._keep_only_old()
