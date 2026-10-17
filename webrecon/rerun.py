@@ -13,7 +13,7 @@ from .cli import (_add_candidates, _candidate_callback, _observed_basenames, _re
                   hash_wordlists,
                   _run_stage, create_run_dir, normalize_host, print_run_summary,
                   write_run_outputs)
-from .dns import rerun_dns_words
+from .dns import rerun_dns_words, run_dns
 from .fuzz import run_extension_filenames, run_extensions, run_paths, run_vhost
 from .progress import ProgressReporter
 from .report import load_json_report
@@ -292,7 +292,26 @@ def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
     else:
         stage_statuses: list[str] = []
         web_origins = 0
-        if "prefixes" in stages and getattr(options, "rerun_dns_words", True):
+        if "dns" in stages:
+            previous_dns = result.get("dns") or {}
+            updated_dns = _run_stage(progress, host, "dns", run_dns,
+                                     host, result.get("resolved_ips", []),
+                                     options.host_prefixes_wordlist, host_dir / "dns",
+                                     on_candidate=_candidate_callback(progress, host, "dns"),
+                                     dns_server=options.dns_server)
+            result["dns"] = updated_dns
+            result.setdefault("stages", {})["dns"] = {
+                "status": updated_dns.get("status", "error")}
+            result.setdefault("scan_settings", {})["dns_server"] = options.dns_server
+            dns_status = updated_dns.get("status", "error")
+            if (dns_status == "unavailable" and
+                    previous_dns.get("status") == "unavailable" and
+                    updated_dns.get("resolver_probe_done")):
+                stage_statuses.append("completed")
+            else:
+                stage_statuses.append(dns_status)
+        if ("prefixes" in stages and "dns" not in stages and
+                getattr(options, "rerun_dns_words", True)):
             previous_dns = result.get("dns", {})
             updated_dns = _run_stage(progress, host, "dns-words", rerun_dns_words,
                                      previous_dns, host, options.host_prefixes_wordlist,

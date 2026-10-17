@@ -78,6 +78,7 @@ class ExtendRunTests(unittest.TestCase):
                                  "scheme": {"status": "completed"},
                                  "dns": {"status": dns_status}},
                       "dns": {"status": dns_status, "candidates": [],
+                              "resolver_probe_done": dns_status == "unavailable",
                               "scanner": {"status": "not_run"}},
                       "tls": {"status": "not_run", "san": []},
                       "web": {"http": {"status": "completed", "origin": origin,
@@ -337,6 +338,133 @@ class ExtendRunTests(unittest.TestCase):
                    for item in fixture_overview(output)["hosts"]}
         self.assertEqual(actions[self.dns_partial], "reused")
         self.assertEqual(actions[dns_failed], "scanned")
+
+    def test_explicit_dns_server_updates_only_dns_and_keeps_web_evidence(self):
+        overview = fixture_overview(self.source)
+        overview["scan_settings"] = {"dns_server": None}
+        overview["hosts"] = [{"host": self.dns_partial, "status": "partial"}]
+        save_fixture_report(self.source, overview)
+        output = self.root / "dns-server-update"
+        replacement = {"status": "completed", "records": {"SOA": ["parent.example.test."]},
+                       "resolver_probe_done": True,
+                       "resolver": {"mode": "explicit", "address": "192.0.2.53"},
+                       "zone": {"name": "example.test", "confirmed": True},
+                       "scanner": {"status": "not_run"}, "candidates": [], "artifacts": []}
+        with patch.object(cli, "run_host", side_effect=AssertionError("full Web scan repeated")), \
+             patch.object(rerun, "run_dns", return_value=replacement) as dns_scan, \
+             patch.object(rerun, "run_vhost", side_effect=AssertionError("vhost repeated")), \
+             patch.object(rerun, "run_paths", side_effect=AssertionError("paths repeated")), \
+             patch.object(rerun, "run_extensions", side_effect=AssertionError("extensions repeated")):
+            code = self._run_cli(["--extend-run", str(self.source),
+                                  "--host", self.dns_partial,
+                                  "--dns-server", "192.0.2.53",
+                                  "--out-dir", str(output)])
+        self.assertEqual(code, 0)
+        self.assertEqual(dns_scan.call_count, 1)
+        self.assertEqual(dns_scan.call_args.kwargs["dns_server"], "192.0.2.53")
+        self.assertEqual(dns_scan.call_args.args[:3],
+                         (self.dns_partial, ["192.0.2.10"], None))
+        saved = json.loads((rerun._host_dir(output, self.dns_partial) / "summary.json").read_text())
+        self.assertEqual(saved["action"], "updated")
+        self.assertEqual(saved["rerun_stages"], ["dns"])
+        self.assertEqual(saved["scan_settings"]["dns_server"], "192.0.2.53")
+        self.assertEqual(saved["dns"]["zone"]["name"], "example.test")
+        self.assertEqual(saved["web"]["http"]["pages"][0]["title"], "Saved")
+        prefix = saved["web"]["http"]["pages"][0]["prefix"]
+        self.assertEqual((output / (prefix + ".body")).read_text(), "saved response")
+        self.assertEqual(saved["scanners"]["http"]["vhost"]["status"], "completed")
+        self.assertEqual(fixture_overview(output)["scan_settings"]["dns_server"], "192.0.2.53")
+
+        continued = self.root / "dns-server-inherited"
+        with patch.object(cli, "run_host", side_effect=AssertionError("Web repeated")), \
+             patch.object(rerun, "run_dns", side_effect=AssertionError("DNS repeated")):
+            self.assertEqual(self._run_cli(["--extend-run", str(output),
+                                            "--host", self.dns_partial,
+                                            "--out-dir", str(continued)]), 0)
+        self.assertEqual(fixture_overview(continued)["scan_settings"]["dns_server"],
+                         "192.0.2.53")
+
+    def test_unavailable_dns_gets_one_fallback_retry_then_reuses_result(self):
+        overview = fixture_overview(self.source)
+        overview["hosts"] = [{"host": self.dns_partial, "status": "partial"}]
+        save_fixture_report(self.source, overview)
+        summary_path = rerun._host_dir(self.source, self.dns_partial) / "summary.json"
+        legacy = json.loads(summary_path.read_text())
+        legacy["dns"].pop("resolver_probe_done")
+        summary_path.write_text(json.dumps(legacy))
+        first = self.root / "dns-fallback-attempt"
+        unavailable = {"status": "unavailable", "resolver_probe_done": True,
+                       "resolver": {"mode": "system", "address": None},
+                       "records": {}, "scanner": {"status": "unavailable"},
+                       "candidates": [], "artifacts": []}
+        with patch.object(cli, "run_host", side_effect=AssertionError("Web repeated")), \
+             patch.object(rerun, "run_dns", return_value=unavailable) as dns_scan:
+            self.assertEqual(self._run_cli(["--extend-run", str(self.source),
+                                            "--host", self.dns_partial,
+                                            "--out-dir", str(first)]), 0)
+        dns_scan.assert_called_once()
+        summary = json.loads((rerun._host_dir(first, self.dns_partial) / "summary.json").read_text())
+        self.assertEqual(summary["action"], "updated")
+        self.assertEqual(summary["rerun_stages"], ["dns"])
+        self.assertEqual(summary["dns"]["status"], "unavailable")
+
+        second = self.root / "dns-fallback-reuse"
+        with patch.object(cli, "run_host", side_effect=AssertionError("Web repeated")), \
+             patch.object(rerun, "run_dns", side_effect=AssertionError("DNS repeated")):
+            self.assertEqual(self._run_cli(["--extend-run", str(first),
+                                            "--host", self.dns_partial,
+                                            "--out-dir", str(second)]), 0)
+        saved = json.loads((rerun._host_dir(second, self.dns_partial) / "summary.json").read_text())
+        self.assertEqual(saved["action"], "reused")
+
+    def test_dns_server_and_prefix_change_reruns_dns_words_once_and_vhost(self):
+        self._keep_only_old()
+        words = self.root / "new-prefixes.txt"
+        words.write_text("admin\n")
+        output = self.root / "dns-and-prefix-update"
+        replacement = {"status": "completed", "records": {"A": ["192.0.2.10"]},
+                       "resolver_probe_done": True,
+                       "resolver": {"mode": "explicit", "address": "192.0.2.53"},
+                       "scanner": {"status": "completed"},
+                       "candidates": [], "artifacts": []}
+        with patch.object(cli, "run_host", side_effect=AssertionError("Web repeated")), \
+             patch.object(rerun, "run_dns", return_value=replacement) as dns_scan, \
+             patch.object(rerun, "rerun_dns_words",
+                          side_effect=AssertionError("DNS words repeated")), \
+             patch.object(rerun, "run_vhost",
+                          return_value={"status": "completed", "candidates": []}) as vhost_scan, \
+             patch.object(rerun, "run_paths", side_effect=AssertionError("paths repeated")), \
+             patch.object(rerun, "run_extensions",
+                          side_effect=AssertionError("extensions repeated")):
+            self.assertEqual(self._run_cli(["--extend-run", str(self.source),
+                                            "--host", self.old,
+                                            "--host-prefixes-wordlist", str(words),
+                                            "--dns-server", "192.0.2.53",
+                                            "--out-dir", str(output)]), 0)
+        dns_scan.assert_called_once()
+        self.assertEqual(dns_scan.call_args.args[2], words)
+        vhost_scan.assert_called_once()
+        summary = json.loads((rerun._host_dir(output, self.old) / "summary.json").read_text())
+        self.assertEqual(summary["rerun_stages"], ["dns", "prefixes"])
+        self.assertEqual(summary["dns"]["scanner"]["status"], "completed")
+
+    def test_failed_dns_replacement_preserves_usable_dns(self):
+        self._keep_only_old()
+        output = self.root / "failed-dns-update"
+        failure = {"status": "error", "diagnostics": ["dig timeout"],
+                   "resolver_probe_done": False, "candidates": []}
+        with patch.object(cli, "run_host", side_effect=AssertionError("Web repeated")), \
+             patch.object(rerun, "run_dns", return_value=failure):
+            self.assertEqual(self._run_cli(["--extend-run", str(self.source),
+                                            "--host", self.old,
+                                            "--dns-server", "192.0.2.53",
+                                            "--out-dir", str(output)]), 1)
+        summary = json.loads((rerun._host_dir(output, self.old) / "summary.json").read_text())
+        self.assertEqual(summary["action"], "retry_failed")
+        self.assertEqual(summary["dns"]["status"], "completed")
+        self.assertEqual(summary["retry"]["stages"], ["dns"])
+        self.assertTrue((rerun._host_dir(output, self.old) /
+                         "attempts" / "latest" / "summary.json").is_file())
 
     def test_missing_saved_wordlist_does_not_block_reuse(self):
         overview = self._keep_only_old()

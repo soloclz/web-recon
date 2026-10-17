@@ -32,6 +32,11 @@ def _inherit_settings(options, overview: dict, summaries: list[dict]) -> None:
             raise ValueError("source run has invalid extension request limit")
         if "max_extra_requests" not in options.explicit_limits:
             options.max_extra_requests = extra
+    saved_dns_server = saved.get("dns_server")
+    if saved_dns_server is not None and not isinstance(saved_dns_server, str):
+        raise ValueError("source run has invalid DNS server setting")
+    if not options.explicit_dns_server:
+        options.dns_server = saved_dns_server
     options.public_sources = bool(options.public_sources or saved.get("public_sources") or
                                   any((result.get("public_sources") or {}).get("status")
                                       not in (None, "not_run") for result in summaries))
@@ -276,7 +281,14 @@ def extend_main(options) -> int:
         else:
             needed = set(changed_stages) | _failed_wordlist_stages(result, options)
             needed.update(stage for stage in retry.get("stages", ())
-                          if stage in (*_WORDLIST_STAGES.values(), "public"))
+                          if stage in (*_WORDLIST_STAGES.values(), "dns", "public"))
+            saved_dns_server = (result.get("scan_settings") or {}).get(
+                "dns_server", (overview.get("scan_settings") or {}).get("dns_server"))
+            previous_dns = result.get("dns") or {}
+            if (saved_dns_server != options.dns_server or
+                    (previous_dns.get("status") == "unavailable" and
+                     not previous_dns.get("resolver_probe_done"))):
+                needed.add("dns")
             saved_extra = (result.get("scan_settings") or {}).get("max_extra_requests")
             if (saved_extra is not None and saved_extra != options.max_extra_requests and
                     options.extensions_wordlist is not None):
@@ -284,7 +296,8 @@ def extend_main(options) -> int:
             public_status = (result.get("public_sources") or {}).get("status")
             if options.public_sources and public_status not in {"completed", "unavailable"}:
                 needed.add("public")
-            stages = tuple(stage for stage in (*_WORDLIST_STAGES.values(), "public") if stage in needed)
+            stages = tuple(stage for stage in ("dns", *_WORDLIST_STAGES.values(), "public")
+                           if stage in needed)
             plans[host] = ("update", stages) if stages else ("reuse", ())
     full_scan = bool(new_hosts or any(action == "scan" for action, _ in plans.values()))
     required_wordlists = set(_WORDLISTS) if full_scan else set()
@@ -294,6 +307,8 @@ def extend_main(options) -> int:
         if action != "update":
             continue
         required_wordlists.update(name for name, stage in _WORDLIST_STAGES.items() if stage in stages)
+        if "dns" in stages and options.host_prefixes_wordlist is not None:
+            required_wordlists.add("host_prefixes_wordlist")
         if "extensions" in stages:
             required_wordlists.add("extension_names_wordlist")
     for name in required_wordlists:
@@ -319,6 +334,8 @@ def extend_main(options) -> int:
                 pending = (source_results[host].get("retry") or {}).get("prefix_components") or ()
                 options.rerun_dns_words, options.rerun_vhost = _prefix_components(
                     source_results[host], options, changed_stages, tuple(pending))
+                if "dns" in stages:
+                    options.rerun_dns_words = False
                 updated = rerun._run_one(source_results[host], source_run, run_dir,
                                          overview, options, progress, source_roots)
                 updated["action"] = "updated"

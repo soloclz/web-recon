@@ -205,12 +205,15 @@ def _read_gobuster_line(line: str, host: str, wildcard_addresses: set[str],
 
 def run_dns(host: str, ips: list[str], prefix_wordlist: Path | None,
             out_dir: Path,
-            on_candidate: Callable[[dict], None] | None = None) -> dict:
+            on_candidate: Callable[[dict], None] | None = None, *,
+            dns_server: str | None = None) -> dict:
     """Query records, PTR, wildcard, confirmed-zone AXFR, and optional DNS words.
 
     Every subprocess receives an argument array. Parent names are checked only
     for a confirmed zone; wordlist prefixes stay under the supplied hostname.
-    No Web address is used as a DNS server. Candidates remain unverified leads.
+    A supplied DNS server takes precedence. If the system resolver cannot
+    confirm a zone, at most two resolved target IPs are checked as DNS servers.
+    Candidates remain unverified leads.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -220,20 +223,31 @@ def run_dns(host: str, ips: list[str], prefix_wordlist: Path | None,
                     "wildcard": {"name": None, "addresses": [], "aliases": [],
                                  "detected": False},
                     "zone": {"name": None, "confirmed": False,
-                             "nameservers": [], "authoritative_nameservers": []},
+                             "nameservers": [], "authoritative_nameservers": [],
+                             "authoritative_servers": []},
                     "checked_zones": [],
+                    "resolver": {"mode": "system", "address": None},
+                    "resolver_probe_done": False,
                     "scanner": {"status": "not_run"}}
     try:
         host = _name(host)
     except ValueError as exc:
         result["diagnostics"].append(str(exc))
         return result
+    if dns_server is not None:
+        try:
+            dns_server = str(ipaddress.ip_address(dns_server))
+        except ValueError:
+            result["diagnostics"].append(f"invalid DNS server IP: {dns_server}")
+            return result
+        result["resolver"] = {"mode": "explicit", "address": dns_server}
 
     candidates: dict[str, dict] = {}
     emitted_records: set[tuple[str, str, str]] = set()
 
     def execute(stem: str, args: list[str], timeout: int = 12,
-                on_stdout_line: Callable[[str], None] | None = None) -> dict:
+                on_stdout_line: Callable[[str], None] | None = None, *,
+                required: bool = True) -> dict:
         run = _write_command(out_dir, stem, args, timeout, on_stdout_line)
         result["queries"].append({key: value for key, value in run.items()
                                   if key != "output"})
@@ -247,7 +261,7 @@ def run_dns(host: str, ips: list[str], prefix_wordlist: Path | None,
                     on_candidate({"kind": "dns_record", "source": "dns_record",
                                   "name": rr["name"], "record_type": rr["type"],
                                   "value": rr["data"]})
-        if run["returncode"] is None or run["returncode"] != 0:
+        if required and (run["returncode"] is None or run["returncode"] != 0):
             result["diagnostics"].append(
                 f"{stem}: timeout" if run["timed_out"] else
                 f"{stem}: exit {run['returncode']}; see stderr")
@@ -255,28 +269,70 @@ def run_dns(host: str, ips: list[str], prefix_wordlist: Path | None,
                 result["required_failures"].append(stem)
         return run
 
-    parsed_by_type = {}
-    for rr_type in RECORD_TYPES:
-        run = execute(f"dig-{rr_type.lower()}",
-                      ["dig", host, rr_type, "+time=3", "+tries=1"])
-        parsed = _parse_dig(run["output"])
-        parsed_by_type[rr_type] = parsed
-        result["records"][rr_type] = _rr_data(parsed, host, rr_type)
-        if parsed["status"] in {"SERVFAIL", "REFUSED"}:
-            result["diagnostics"].append(f"dig {rr_type}: {parsed['status']}")
+    def dig_args(server: str | None, *parts: str) -> list[str]:
+        return ["dig", *([f"@{server}"] if server else []), *parts]
 
-    for index, ip_text in enumerate(dict.fromkeys(ips)):
+    def query_records(server: str | None, stem_prefix: str = "") -> dict[str, dict]:
+        parsed_by_type = {}
+        for rr_type in RECORD_TYPES:
+            run = execute(f"{stem_prefix}dig-{rr_type.lower()}",
+                          dig_args(server, host, rr_type, "+time=3", "+tries=1"))
+            parsed = _parse_dig(run["output"])
+            parsed_by_type[rr_type] = parsed
+            result["records"][rr_type] = _rr_data(parsed, host, rr_type)
+            if parsed["status"] in {"SERVFAIL", "REFUSED"}:
+                result["diagnostics"].append(f"dig {rr_type}: {parsed['status']}")
+        return parsed_by_type
+
+    def query_ptr(server: str | None, stem_prefix: str = "") -> None:
+        for index, ip in enumerate(resolved_ips):
+            run = execute(f"{stem_prefix}dig-ptr-{index}",
+                          dig_args(server, "-x", ip, "+time=3", "+tries=1"))
+            parsed = _parse_dig(run["output"])
+            for rr in parsed["answers"]:
+                if rr["type"] == "PTR":
+                    _add_candidate(candidates, rr["data"], "dns_ptr", on_candidate)
+
+    def authoritative_at(server: str, zone_name: str, stem: str, *,
+                         optional_probe: bool = False) -> tuple[bool, list[str]]:
+        # The advertised NS can point elsewhere. The server which answers with
+        # aa and an exact SOA/NS pair is the one eligible for AXFR.
+        wait = "+time=1" if optional_probe else "+time=3"
+        soa = _parse_dig(execute(
+            f"{stem}-soa", dig_args(server, zone_name, "SOA", "+norecurse",
+                                      wait, "+tries=1"),
+            required=not optional_probe)["output"])
+        if (soa["status"] != "NOERROR" or not soa["authoritative"] or
+                not _rr_data(soa, zone_name, "SOA")):
+            return False, []
+        ns = _parse_dig(execute(
+            f"{stem}-ns", dig_args(server, zone_name, "NS", "+norecurse",
+                                      wait, "+tries=1"),
+            required=not optional_probe)["output"])
+        if ns["status"] != "NOERROR" or not ns["authoritative"]:
+            return False, []
+        nameservers = []
+        for entry in _rr_data(ns, zone_name, "NS"):
+            try:
+                nameservers.append(_name(entry.split()[0]))
+            except ValueError:
+                result["diagnostics"].append(
+                    f"{zone_name}: invalid NS record: {entry}")
+        nameservers = list(dict.fromkeys(nameservers))
+        return bool(nameservers), nameservers
+
+    resolved_ips = []
+    for ip_text in dict.fromkeys(ips):
         try:
             ip = str(ipaddress.ip_address(ip_text))
         except ValueError:
             result["diagnostics"].append(f"invalid resolved IP: {ip_text}")
             continue
-        run = execute(f"dig-ptr-{index}",
-                      ["dig", "-x", ip, "+time=3", "+tries=1"])
-        parsed = _parse_dig(run["output"])
-        for rr in parsed["answers"]:
-            if rr["type"] == "PTR":
-                _add_candidate(candidates, rr["data"], "dns_ptr", on_candidate)
+        if ip not in resolved_ips:
+            resolved_ips.append(ip)
+
+    parsed_by_type = query_records(dns_server)
+    query_ptr(dns_server)
 
     usable = any(parsed["status"] == "NOERROR" and
                  any(rr["name"] == host for rr in parsed["answers"])
@@ -294,10 +350,10 @@ def run_dns(host: str, ips: list[str], prefix_wordlist: Path | None,
         else:
             zone_soa = _parse_dig(execute(
                 f"dig-zone-{level}-soa",
-                ["dig", zone_name, "SOA", "+time=3", "+tries=1"])["output"])
+                dig_args(dns_server, zone_name, "SOA", "+time=3", "+tries=1"))["output"])
             zone_ns = _parse_dig(execute(
                 f"dig-zone-{level}-ns",
-                ["dig", zone_name, "NS", "+time=3", "+tries=1"])["output"])
+                dig_args(dns_server, zone_name, "NS", "+time=3", "+tries=1"))["output"])
         exact_soa = zone_soa["status"] == "NOERROR" and bool(
             _rr_data(zone_soa, zone_name, "SOA"))
         nameservers = []
@@ -310,30 +366,66 @@ def run_dns(host: str, ips: list[str], prefix_wordlist: Path | None,
                         f"{zone_name}: invalid NS record: {entry}")
         nameservers = list(dict.fromkeys(nameservers))
         authoritative_ns = []
-        if exact_soa:
+        authoritative_servers = []
+        if dns_server is not None:
+            confirmed, verified_ns = authoritative_at(
+                dns_server, zone_name, f"dig-zone-{level}-server")
+            if confirmed:
+                exact_soa = True
+                nameservers = verified_ns
+                authoritative_servers.append(dns_server)
+        elif exact_soa:
             for ns_index, nameserver in enumerate(nameservers):
-                ns_soa = _parse_dig(execute(
-                    f"dig-zone-{level}-ns-{ns_index}-soa",
-                    ["dig", f"@{nameserver}", zone_name, "SOA", "+norecurse",
-                     "+time=3", "+tries=1"])["output"])
-                ns_ns = _parse_dig(execute(
-                    f"dig-zone-{level}-ns-{ns_index}-ns",
-                    ["dig", f"@{nameserver}", zone_name, "NS", "+norecurse",
-                     "+time=3", "+tries=1"])["output"])
-                if (ns_soa["status"] == "NOERROR" and ns_soa["authoritative"]
-                        and _rr_data(ns_soa, zone_name, "SOA")
-                        and ns_ns["status"] == "NOERROR" and ns_ns["authoritative"]
-                        and _rr_data(ns_ns, zone_name, "NS")):
+                confirmed, _ = authoritative_at(
+                    nameserver, zone_name, f"dig-zone-{level}-ns-{ns_index}")
+                if confirmed:
                     authoritative_ns.append(nameserver)
+                    authoritative_servers.append(nameserver)
         result["checked_zones"].append(
             {"name": zone_name, "exact_soa": exact_soa,
              "nameservers": nameservers,
-             "authoritative_nameservers": authoritative_ns})
-        if authoritative_ns:
+             "authoritative_nameservers": authoritative_ns,
+             "authoritative_servers": authoritative_servers})
+        if authoritative_servers:
             result["zone"] = {"name": zone_name, "confirmed": True,
                               "nameservers": nameservers,
-                              "authoritative_nameservers": authoritative_ns}
+                              "authoritative_nameservers": authoritative_ns,
+                              "authoritative_servers": authoritative_servers}
             break
+
+    if dns_server is None and not result["zone"]["confirmed"]:
+        # The target may itself run DNS while the configured resolver cannot
+        # answer for a lab zone. Try no more than two target addresses.
+        for level, zone_name in enumerate(zone_names):
+            for ip_index, ip in enumerate(resolved_ips[:2]):
+                confirmed, nameservers = authoritative_at(
+                    ip, zone_name, f"dig-target-{level}-{ip_index}",
+                    optional_probe=True)
+                if not confirmed:
+                    continue
+                result["zone"] = {"name": zone_name, "confirmed": True,
+                                  "nameservers": nameservers,
+                                  "authoritative_nameservers": [],
+                                  "authoritative_servers": [ip]}
+                result["resolver"] = {"mode": "target", "address": ip}
+                result["checked_zones"].append(
+                    {"name": zone_name, "exact_soa": True,
+                     "nameservers": nameservers,
+                     "authoritative_nameservers": [],
+                     "authoritative_servers": [ip]})
+                # These replace the failed system-resolver checks. Their raw
+                # results stay in queries for audit, but do not mark this DNS
+                # stage partial when the selected target server succeeds.
+                result["required_failures"].clear()
+                parsed_by_type = query_records(ip, "target-")
+                query_ptr(ip, "target-")
+                usable = any(parsed["status"] == "NOERROR" and
+                             any(rr["name"] == host for rr in parsed["answers"])
+                             for parsed in parsed_by_type.values())
+                break
+            if result["zone"]["confirmed"]:
+                break
+    result["resolver_probe_done"] = True
 
     if not usable and not result["zone"]["confirmed"]:
         result["status"] = "error" if result["required_failures"] else "unavailable"
@@ -343,7 +435,7 @@ def run_dns(host: str, ips: list[str], prefix_wordlist: Path | None,
                 "reason": "DNS checks failed" if result["required_failures"] else
                           "no input record or confirmed DNS zone"}
         result["diagnostics"].append(
-            "configured DNS resolver did not return an input record or confirmed zone")
+            "DNS resolver did not return an input record or confirmed zone")
         result["candidates"] = list(candidates.values())
         return result
 
@@ -355,7 +447,8 @@ def run_dns(host: str, ips: list[str], prefix_wordlist: Path | None,
     wildcard_aliases: set[str] = set()
     for rr_type in ("A", "AAAA", "CNAME"):
         run = execute(f"dig-wildcard-{rr_type.lower()}",
-                      ["dig", wildcard_name, rr_type, "+time=3", "+tries=1"])
+                      dig_args(result["resolver"]["address"], wildcard_name,
+                               rr_type, "+time=3", "+tries=1"))
         parsed = _parse_dig(run["output"])
         if rr_type == "CNAME":
             wildcard_aliases.update(_rr_data(parsed, wildcard_name, rr_type))
@@ -367,16 +460,26 @@ def run_dns(host: str, ips: list[str], prefix_wordlist: Path | None,
 
     if result["zone"]["confirmed"]:
         zone_name = result["zone"]["name"]
-        for index, nameserver in enumerate(result["zone"]["authoritative_nameservers"]):
+        for index, nameserver in enumerate(result["zone"]["authoritative_servers"]):
             run = execute(f"dig-axfr-{index}",
                           ["dig", f"@{nameserver}", zone_name, "AXFR",
                            "+time=3", "+tries=1"], timeout=30)
             if "XFR size:" not in run["output"]:
                 continue
+            axfr_names: dict[str, set[str]] = {}
             for rr in _parse_dig(run["output"])["answers"]:
                 owner = rr["name"]
                 if owner != host and owner != zone_name and owner.endswith(f".{zone_name}"):
-                    _add_candidate(candidates, owner, "dns_axfr", on_candidate)
+                    addresses = axfr_names.setdefault(owner, set())
+                    if rr["type"] in {"A", "AAAA"}:
+                        try:
+                            addresses.add(str(ipaddress.ip_address(rr["data"])))
+                        except ValueError:
+                            pass
+            for owner, addresses in axfr_names.items():
+                _add_candidate(candidates, owner, "dns_axfr", on_candidate,
+                               addresses=sorted(addresses),
+                               axfr_addresses=sorted(addresses))
 
     if prefix_wordlist is not None:
         prefix_wordlist = Path(prefix_wordlist)
@@ -389,8 +492,11 @@ def run_dns(host: str, ips: list[str], prefix_wordlist: Path | None,
                 _read_gobuster_line(line, host, wildcard_addresses,
                                     candidates, on_candidate)
 
-            run = execute("gobuster-dns", ["gobuster", "dns", "--domain", host,
-                                           "-w", str(prefix_wordlist)], timeout=600,
+            gobuster_args = ["gobuster", "dns", "--domain", host,
+                             "-w", str(prefix_wordlist)]
+            if result["resolver"]["address"]:
+                gobuster_args.extend(["--resolver", result["resolver"]["address"]])
+            run = execute("gobuster-dns", gobuster_args, timeout=600,
                           on_stdout_line=found_line if on_candidate else None)
             result["scanner"] = {"status": run["status"],
                                  "command": run["command"],
@@ -441,6 +547,8 @@ def rerun_dns_words(previous_dns: dict, host: str, prefix_wordlist: Path | None,
         if "gobuster_dns" in item.get("other_sources", []):
             candidate.pop("addresses", None)
             candidate.pop("wildcard_match", None)
+            if candidate.get("axfr_addresses"):
+                candidate["addresses"] = candidate["axfr_addresses"]
         fixed_candidates[candidate["name"]] = candidate
 
     old_scanner_artifacts = set()
@@ -489,9 +597,12 @@ def rerun_dns_words(previous_dns: dict, host: str, prefix_wordlist: Path | None,
                 _read_gobuster_line(line, host, wildcard_addresses,
                                     fixed_candidates, on_candidate)
 
-            run = _write_command(out_dir, "gobuster-dns",
-                                 ["gobuster", "dns", "--domain", host,
-                                  "-w", str(prefix_wordlist)], 600,
+            gobuster_args = ["gobuster", "dns", "--domain", host,
+                             "-w", str(prefix_wordlist)]
+            selected_server = (result.get("resolver") or {}).get("address")
+            if selected_server:
+                gobuster_args.extend(["--resolver", selected_server])
+            run = _write_command(out_dir, "gobuster-dns", gobuster_args, 600,
                                  on_stdout_line=found_line if on_candidate else None)
             result["queries"].append({key: value for key, value in run.items()
                                       if key != "output"})

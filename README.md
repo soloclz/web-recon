@@ -21,6 +21,8 @@ For an existing checkout, use `git -C ~/tools/web-recon pull --ff-only`.
 
 The repository supplies no wordlists. Provide the paths to wordlists installed on your machine. A hostname is a bare name such as `app.example.test`; do not include a scheme, path, or port in `--host` or `hosts.txt`. Set up any lab hosts entries before running the tool.
 
+By default, DNS checks use the system DNS resolver first. When it cannot confirm a zone, the tool checks up to two resolved target IPs for authoritative SOA and NS replies. If DNS runs on another IP, supply it with `--dns-server IP`; the tool uses that server for `dig`, AXFR, and `gobuster dns`. The Web port remains the value of `--port`.
+
 ## First scan
 
 Run from the engagement directory. The tool creates a new `web-recon-YYYYMMDD-HHMMSS/` directory there and prints its path at startup.
@@ -51,7 +53,7 @@ The file takes one hostname per line. Blank lines and `#` comments are ignored; 
 
 | Option | Scan |
 | --- | --- |
-| `--host-prefixes-wordlist FILE` | `gobuster dns` and `ffuf` HTTP vhost. Each entry is prepended to the **input hostname**: `admin` with `app.example.test` tests `admin.app.example.test`. The vhost scan changes the HTTP `Host` header. |
+| `--host-prefixes-wordlist FILE` | `gobuster dns` and `ffuf` HTTP vhost. Each entry is prepended to the **input hostname**: `admin` with `app.example.test` tests `admin.app.example.test`. The vhost scan changes the HTTP `Host` header. When a DNS server is selected, Gobuster uses it. |
 | `--paths-wordlist FILE` | `ffuf` guesses root paths such as `/admin`. It does not recurse. |
 | `--extensions-wordlist FILE` | Tests extensions on known basenames, such as `/index.php`. If an extension differs from the missing-path control and a path wordlist is available, that list also guesses filenames such as `/admin.php`. |
 
@@ -86,7 +88,7 @@ jq '.hosts[] | select(.host == "app.example.test") | .web.http.inventory.form_fi
 jq -r '.hosts[] | .host as $host | .web[]? | .pages[]? | [$host, .url] | @tsv' "$RUN/report.json"
 ```
 
-`new_hosts` at the report root lists candidate hostnames not already included as hosts in the merged run. Each entry's `observations` records the input host, discovery sources, and that input host's connected IP:port. The address is a starting point for checking the candidate, not a confirmed address for it. The first `jq` example above prints the names; redirect its output to a file if you want a list to review and add to your hosts file for the next run.
+`new_hosts` at the report root lists candidate hostnames not already included as hosts in the merged run. Each entry's `observations` records the input host, discovery sources, and that input host's connected IP:port. DNS findings also include `dns_addresses` when a record supplies them. Use those addresses for DNS-discovered names; `source_ip_port` identifies the Web connection that led to the scan. The first `jq` example above prints the names; redirect its output to a file if you want a list to review and add to your hosts file for the next run.
 
 The run root contains `report.json` and `progress.jsonl` (live events). `report.json.run` holds the run settings; `report.json.hosts[]` holds each host's status and results. Under `hosts/<hostname>-<hash>/`, each host has an internal `summary.json` and the original Web responses, TLS data, DNS output, and scanner output. These files let later runs reuse evidence and let you verify a candidate against its missing-path or default-vhost control. Start normal reading and `jq` queries with `report.json`; inspect a host directory when you need the raw evidence.
 
@@ -159,7 +161,7 @@ python3 ~/tools/web-recon/scripts/web-recon.py \
 
 `--fresh` does not inherit wordlists or limits. Supply each option you want for the new scan. To repeat only the fixed checks and crawl after changing crawl limits, use `--fresh` with the host and port but no wordlist flags. A continued run keeps its saved crawl limits, including limits saved by older tool versions.
 
-The tool can detect changed local wordlists and explicit limit changes. It cannot detect remote page changes without requesting the pages again. Changing `--max-pages`, `--max-depth`, `--max-body-bytes`, or `--max-requests` causes affected old hosts to run a fresh host scan, including their configured wordlists; changing only `--max-extra-requests` updates the extension stage. Changing only `--ffuf-rate` does not rerun a completed scan.
+The tool can detect changed local wordlists and explicit limit changes. It cannot detect remote page changes without requesting the pages again. Changing `--max-pages`, `--max-depth`, `--max-body-bytes`, or `--max-requests` causes affected old hosts to run a fresh host scan, including their configured wordlists; changing only `--max-extra-requests` updates the extension stage. Changing `--dns-server` reruns DNS checks and any configured DNS prefix wordlist while reusing Web and HTTP scanner results. Older saved DNS results marked `unavailable` are checked once more with the target-IP fallback. Changing only `--ffuf-rate` does not rerun a completed scan.
 
 ### Force selected wordlist stages
 
@@ -192,7 +194,7 @@ For each resolvable hostname, the fixed checks:
 1. Probe HTTP and HTTPS on the given port; save the root response, redirects, and TLS certificate SAN names. Lab self-signed certificates are accepted for inspection; this check does not validate the certificate trust chain.
 2. Use two random missing paths as controls. Check `robots.txt`, common sitemap locations and `Sitemap:` entries, a small set of `/.well-known/` metadata, `.git/HEAD`, `.env`, OpenAPI/Swagger locations, and common product files. At most 10 sitemap files are read. URLs in sitemaps become candidates rather than new page requests. Concrete same-origin `Allow:` and `Disallow:` paths in `robots.txt` join the bounded page crawl; wildcard patterns are not queued.
 3. Crawl the same origin for links, forms, field names, comments, and loaded JavaScript URLs. Extract the nine inventory lists described above from fetched HTML. Check source maps only for discovered JavaScript. The crawler does not execute JavaScript or fetch media and document references solely to inventory them.
-4. Query DNS records, PTR, SOA/NS, and a wildcard control. Try AXFR only when the input name is confirmed as a zone and its NS answers with an authoritative SOA. If a hosts entry makes Web access possible but DNS cannot answer for that zone, the DNS stage is `unavailable` while Web and vhost checks continue.
+4. Query DNS records, PTR, SOA/NS, and a wildcard control. For an exact zone confirmed by authoritative SOA and NS replies, try AXFR against the server that gave those replies. The input hostname may be below that zone; the check walks parent names up to the confirmed zone. The responding server can differ from the address in the advertised NS record. If no queried server returns an input record or confirms the zone, DNS is `unavailable` while Web and vhost checks continue.
 5. Compare fixed-path and ffuf hits with missing-path or default-vhost controls. A baseline match is not treated as a discovery; scanner errors and incomplete results are saved separately.
 
 Default built-in Web limits are 100 crawled pages, depth 99, 1 MiB per saved body, and 200 built-in Web requests per host. Depth 99 lets a single chain use the 100-page budget. URLs beyond a limit remain in the candidate list, and the Web stage is marked `partial` with the applicable limit reason. `--max-requests` does not cap ffuf or Gobuster. Use `--max-pages`, `--max-depth`, `--max-body-bytes`, and `--max-requests` to change these limits. For a larger linear crawl, raise all three of `--max-pages`, `--max-depth`, and `--max-requests`.

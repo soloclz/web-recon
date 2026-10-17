@@ -12,6 +12,7 @@ from urllib.parse import urlsplit
 
 from webrecon import cli, http
 from webrecon.extract import empty_inventory
+from webrecon.result_view import unscanned_hosts
 
 
 def make_response(url, status=200, body=b"", content_type="text/html", exit_code=0):
@@ -284,6 +285,31 @@ class HttpCliTests(unittest.TestCase):
         self.assertTrue(any(item["host"] == "good.htb" and item["stage"] == "scanner:http:paths"
                             and item["event"] == "finish" for item in events))
 
+    def test_dns_server_option_reaches_dns_stage_and_report(self):
+        out_dir = self.root / "dns-server-run"
+        observed = []
+
+        def dns_scan(host, ips, wordlist, out_dir, *, on_candidate=None,
+                     dns_server=None):
+            observed.append((host, ips, dns_server))
+            return {"status": "completed", "candidates": [],
+                    "resolver": {"mode": "explicit", "address": dns_server}}
+
+        with patch.object(cli, "resolve_host", return_value=["192.0.2.10"]), \
+             patch.object(cli, "run_dns", side_effect=dns_scan), \
+             patch.object(cli, "probe_origins", return_value={"status": "unavailable",
+                                                                "origins": [], "probes": {}}), \
+             patch.object(cli, "get_tls_certificate", return_value={"status": "unavailable",
+                                                                       "san": []}):
+            code = cli.main(["--fresh", "--host", "app.example.test", "--port", "8080",
+                             "--dns-server", "192.0.2.53", "--out-dir", str(out_dir)])
+
+        self.assertEqual(code, 1)  # Web scheme was deliberately unavailable.
+        self.assertEqual(observed, [("app.example.test", ["192.0.2.10"], "192.0.2.53")])
+        report = json.loads((out_dir / "report.json").read_text())
+        self.assertEqual(report["run"]["scan_settings"]["dns_server"], "192.0.2.53")
+        self.assertEqual(report["hosts"][0]["dns"]["resolver"]["address"], "192.0.2.53")
+
     def test_dns_overlaps_web_and_two_scanners_can_overlap(self):
         out_dir = self.root / "parallel-run"
         dns_started = Event()
@@ -405,6 +431,19 @@ class HttpCliTests(unittest.TestCase):
                   "dns": {"candidates": []}, "web": {}, "scanners": {}, "public_sources": {}}
         found = cli._add_candidates("app.example.test", result, ["192.0.2.8"], 8080)
         self.assertEqual(found[0]["source_ip_port"], ["192.0.2.7:8080"])
+
+    def test_axfr_candidate_keeps_its_dns_address_in_merged_report(self):
+        result = {"stages": {"scheme": {"probes": {"http": {"usable": True,
+                    "remote_ip": "192.0.2.7"}}}}, "tls": {"san": []},
+                  "dns": {"candidates": [{"name": "api.example.test",
+                                           "source": "dns_axfr",
+                                           "addresses": ["192.0.2.88"]}]},
+                  "web": {}, "scanners": {}, "public_sources": {}}
+        found = cli._add_candidates("app.example.test", result, ["192.0.2.7"], 8080)
+        merged = unscanned_hosts([{"host": "app.example.test", "new_hosts": found}])
+        observation = merged[0]["observations"][0]
+        self.assertEqual(observation["dns_addresses"], ["192.0.2.88"])
+        self.assertEqual(observation["source_ip_port"], ["192.0.2.7:8080"])
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ def scan_settings(options: argparse.Namespace) -> dict:
     return {"web": {name: getattr(options, name) for name in WEB_LIMIT_NAMES},
             "max_extra_requests": options.max_extra_requests,
             "ffuf_rate": options.ffuf_rate,
+            "dns_server": getattr(options, "dns_server", None),
             "public_sources": options.public_sources}
 
 
@@ -171,7 +172,8 @@ def _add_candidates(host: str, result: dict, ips: list[str], port: int) -> list[
     target_ip_port = [f"[{ip}]:{port}" if ":" in ip else f"{ip}:{port}"
                       for ip in sorted(connected_ips)]
 
-    def add(name: str, source: str, endpoint: list[str] | None = target_ip_port):
+    def add(name: str, source: str, endpoint: list[str] | None = target_ip_port,
+            dns_addresses: list[str] | None = None):
         try:
             name = normalize_host(name)
         except ValueError:
@@ -183,12 +185,16 @@ def _add_candidates(host: str, result: dict, ips: list[str], port: int) -> list[
             entry["sources"].append(source)
         if endpoint and not entry["source_ip_port"]:
             entry["source_ip_port"] = endpoint
+        if dns_addresses:
+            entry["dns_addresses"] = sorted(set(entry.get("dns_addresses", [])) |
+                                            set(dns_addresses))
 
     for name in result.get("tls", {}).get("san", []):
         add(name, "tls_san")
     for candidate in result.get("dns", {}).get("candidates", []):
         if not candidate.get("wildcard_match"):
-            add(candidate.get("name", ""), candidate.get("source", "dns"))
+            add(candidate.get("name", ""), candidate.get("source", "dns"),
+                dns_addresses=candidate.get("addresses"))
     for origin in result.get("web", {}).values():
         for candidate in origin.get("found_hosts", []):
             add(candidate.get("name", ""), candidate.get("source", "web_link"))
@@ -240,10 +246,13 @@ def run_host(host: str, port: int, run_dir: Path, options: argparse.Namespace,
     result["stages"]["resolution"] = {"status": "completed", "addresses": ips}
     summary_script = Path(__file__).resolve().parents[1] / "scripts" / "web-summary.py"
     client = HttpClient(host_dir / "responses", summary_script, options.max_body_bytes, options.max_requests)
+    dns_options = ({"dns_server": options.dns_server}
+                   if getattr(options, "dns_server", None) else {})
     with ThreadPoolExecutor(max_workers=1) as dns_pool:
         dns_future = dns_pool.submit(_run_stage, progress, host, "dns", run_dns,
                                      host, ips, options.host_prefixes_wordlist, host_dir / "dns",
-                                     on_candidate=_candidate_callback(progress, host, "dns"))
+                                     on_candidate=_candidate_callback(progress, host, "dns"),
+                                     **dns_options)
         scheme = _run_stage(progress, host, "scheme", probe_origins, host, port, client,
                             on_candidate=_candidate_callback(progress, host, "scheme"))
         result["stages"]["scheme"] = {key: value for key, value in scheme.items() if key != "origins"}
@@ -405,6 +414,8 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--host-prefixes-wordlist", type=Path)
     ap.add_argument("--paths-wordlist", type=Path)
     ap.add_argument("--extensions-wordlist", type=Path)
+    ap.add_argument("--dns-server", metavar="IP",
+                    help="DNS server to query, including for zone checks and AXFR")
     ap.add_argument("--public-sources", action="store_true")
     ap.add_argument("--out-dir", type=Path)
     ap.add_argument("--max-pages", type=int, default=100)
@@ -458,10 +469,13 @@ def main(argv: list[str] | None = None) -> int:
                             if any(arg == "--" + name.replace("_", "-") or
                                    arg.startswith("--" + name.replace("_", "-") + "=")
                                    for arg in raw_argv)}
+    args.explicit_dns_server = args.dns_server is not None
     if args.from_run is None and args.extend_run is None and (
             (args.host is None and args.hosts_file is None) or args.port is None):
         ap.error("fresh runs require --host or --hosts-file and --port")
     if args.from_run is not None:
+        if args.dns_server is not None:
+            ap.error("--dns-server updates fixed DNS checks; use normal continuation or --fresh")
         if args.hosts_file is not None:
             ap.error("--from-run reads the host list from the source run; omit --hosts-file")
         if args.only is None:
@@ -496,6 +510,11 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--fresh cannot be combined with --from-run or --extend-run")
     if args.port is not None and not 1 <= args.port <= 65535:
         ap.error("--port must be between 1 and 65535")
+    if args.dns_server is not None:
+        try:
+            args.dns_server = str(ipaddress.ip_address(args.dns_server))
+        except ValueError:
+            ap.error("--dns-server must be an IPv4 or IPv6 address")
     if args.max_pages < 1 or args.max_depth < 0 or args.max_body_bytes < 1024 or args.max_requests < 4 or args.max_extra_requests < 0:
         ap.error("request and crawl limits are invalid")
     if not 1 <= args.scanner_workers <= 3:

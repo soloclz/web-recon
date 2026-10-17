@@ -199,6 +199,125 @@ class DnsTest(unittest.TestCase):
             self.assertIn(["dig", "@ns.example.test", "example.test", "AXFR", "+time=3", "+tries=1"], commands)
             self.assertIn(["gobuster", "dns", "--domain", "example.test", "-w", str(wordlist)], commands)
 
+    def test_explicit_dns_server_confirms_zone_and_axfr_at_same_ip(self) -> None:
+        host = "dev.portal.example.test"
+        zone = "example.test"
+        server = "192.0.2.53"
+        commands = []
+
+        def fake_run(args, **kwargs):
+            commands.append(args)
+            if args[0] == "gobuster":
+                self.assertEqual(server, args[args.index("--resolver") + 1])
+                return subprocess.CompletedProcess(args, 0, "", "")
+            self.assertEqual(f"@{server}", args[1])
+            if "AXFR" in args:
+                return subprocess.CompletedProcess(args, 0,
+                    f"{zone}. 300 IN SOA ns.{zone}. hostmaster.{zone}. 1 1 1 1 1\n"
+                    f"app.{zone}. 300 IN A 192.0.2.88\n"
+                    f"app.{zone}. 300 IN AAAA 2001:db8::88\n"
+                    f"{zone}. 300 IN SOA ns.{zone}. hostmaster.{zone}. 1 1 1 1 1\n"
+                    ";; XFR size: 4 records (messages 1, bytes 200)\n", "")
+            owner, rr_type = args[2:4]
+            if owner == host and rr_type == "A":
+                return subprocess.CompletedProcess(args, 0,
+                    dig_output(f"{host}. 300 IN A 192.0.2.20"), "")
+            if owner == zone and rr_type in {"SOA", "NS"}:
+                record = (f"{zone}. 300 IN SOA ns.{zone}. hostmaster.{zone}. 1 1 1 1 1"
+                          if rr_type == "SOA" else f"{zone}. 300 IN NS ns.{zone}.")
+                return subprocess.CompletedProcess(args, 0, dig_output(record, aa=True), "")
+            return subprocess.CompletedProcess(args, 0, dig_output(status="NXDOMAIN"), "")
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(dns.subprocess, "run", fake_run):
+            wordlist = Path(tmp) / "prefixes.txt"
+            wordlist.write_text("admin\n", encoding="utf-8")
+            result = dns.run_dns(host, ["192.0.2.20"], wordlist, Path(tmp) / "dns",
+                                 dns_server=server)
+            self.assertEqual("completed", result["status"])
+            self.assertEqual({"mode": "explicit", "address": server}, result["resolver"])
+            self.assertTrue(result["resolver_probe_done"])
+            self.assertEqual(zone, result["zone"]["name"])
+            self.assertEqual(["ns.example.test"], result["zone"]["nameservers"])
+            self.assertEqual([server], result["zone"]["authoritative_servers"])
+            self.assertEqual([], result["zone"]["authoritative_nameservers"])
+            app = next(item for item in result["candidates"] if item["name"] == "app.example.test")
+            self.assertEqual("dns_axfr", app["source"])
+            self.assertEqual(["192.0.2.88", "2001:db8::88"], app["addresses"])
+            self.assertEqual(app["addresses"], app["axfr_addresses"])
+            self.assertIn(["dig", f"@{server}", zone, "AXFR", "+time=3", "+tries=1"],
+                          commands)
+            self.assertFalse(any("@ns.example.test" in command for command in commands))
+
+            updated = dns.rerun_dns_words(result, host, wordlist, Path(tmp) / "rerun")
+            self.assertEqual("completed", updated["status"])
+            self.assertIn(["gobuster", "dns", "--domain", host, "-w", str(wordlist),
+                           "--resolver", server], commands)
+
+    def test_resolved_target_ip_fallback_uses_authoritative_server(self) -> None:
+        host = "dev.portal.example.test"
+        zone = "example.test"
+        target_ip = "192.0.2.20"
+        commands = []
+
+        def fake_run(args, **kwargs):
+            commands.append(args)
+            if args[0] == "gobuster":
+                self.assertEqual(target_ip, args[args.index("--resolver") + 1])
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[1] != f"@{target_ip}":
+                return subprocess.CompletedProcess(args, 0, dig_output(status="NXDOMAIN"), "")
+            if "AXFR" in args:
+                return subprocess.CompletedProcess(args, 0,
+                    f"{zone}. 300 IN SOA ns.{zone}. hostmaster.{zone}. 1 1 1 1 1\n"
+                    f"internal.{zone}. 300 IN A 192.0.2.99\n"
+                    f"{zone}. 300 IN SOA ns.{zone}. hostmaster.{zone}. 1 1 1 1 1\n"
+                    ";; XFR size: 3 records (messages 1, bytes 200)\n", "")
+            owner, rr_type = args[2:4]
+            if owner == host and rr_type == "A":
+                return subprocess.CompletedProcess(args, 0,
+                    dig_output(f"{host}. 300 IN A {target_ip}"), "")
+            if owner == zone and rr_type in {"SOA", "NS"}:
+                record = (f"{zone}. 300 IN SOA ns.{zone}. hostmaster.{zone}. 1 1 1 1 1"
+                          if rr_type == "SOA" else f"{zone}. 300 IN NS ns.{zone}.")
+                return subprocess.CompletedProcess(args, 0, dig_output(record, aa=True), "")
+            return subprocess.CompletedProcess(args, 0, dig_output(status="NXDOMAIN"), "")
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(dns.subprocess, "run", fake_run):
+            wordlist = Path(tmp) / "prefixes.txt"
+            wordlist.write_text("admin\n", encoding="utf-8")
+            result = dns.run_dns(host, [target_ip], wordlist, Path(tmp) / "dns")
+            self.assertEqual("completed", result["status"])
+            self.assertEqual({"mode": "target", "address": target_ip}, result["resolver"])
+            self.assertTrue(result["resolver_probe_done"])
+            self.assertEqual([target_ip], result["zone"]["authoritative_servers"])
+            self.assertEqual([target_ip], result["records"]["A"])
+            self.assertIn("internal.example.test", [item["name"] for item in result["candidates"]])
+            self.assertTrue(any(args[:2] == ["dig", f"@{target_ip}"] and
+                                "webrecon-" in " ".join(args) for args in commands))
+            self.assertIn(["dig", f"@{target_ip}", zone, "AXFR", "+time=3", "+tries=1"],
+                          commands)
+
+    def test_target_fallback_requires_authoritative_soa_and_ns(self) -> None:
+        host = "app.example.test"
+        target_ip = "192.0.2.20"
+        commands = []
+
+        def fake_run(args, **kwargs):
+            commands.append(args)
+            if args[1] == f"@{target_ip}" and args[2] == "example.test":
+                rr_type = args[3]
+                record = ("example.test. 300 IN SOA ns.example.test. hostmaster.example.test. 1 1 1 1 1"
+                          if rr_type == "SOA" else "example.test. 300 IN NS ns.example.test.")
+                return subprocess.CompletedProcess(args, 0, dig_output(record, aa=False), "")
+            return subprocess.CompletedProcess(args, 0, dig_output(status="NXDOMAIN"), "")
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(dns.subprocess, "run", fake_run):
+            result = dns.run_dns(host, [target_ip], None, Path(tmp))
+            self.assertEqual("unavailable", result["status"])
+            self.assertTrue(result["resolver_probe_done"])
+            self.assertFalse(result["zone"]["confirmed"])
+            self.assertFalse(any("AXFR" in command for command in commands))
+
     def test_non_authoritative_soa_does_not_trigger_axfr(self) -> None:
         commands = []
 

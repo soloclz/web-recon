@@ -50,7 +50,8 @@ class AutoContinueTests(unittest.TestCase):
             "stages": {"resolution": {"status": "completed"},
                        "scheme": {"status": "completed"},
                        "dns": {"status": dns_status}},
-            "dns": {"status": dns_status, "candidates": [],
+            "dns": {"status": dns_status, "resolver_probe_done": True,
+                    "candidates": [],
                     "scanner": {"status": "completed" if options.host_prefixes_wordlist
                                 else "not_run"}},
             "tls": {"status": "not_run", "san": []},

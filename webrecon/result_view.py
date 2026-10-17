@@ -19,6 +19,8 @@ def unscanned_hosts(hosts: list[dict]) -> list[dict]:
             observation = {"input_host": host.get("host"),
                            "sources": item.get("sources", []),
                            "source_ip_port": item.get("source_ip_port", [])}
+            if item.get("dns_addresses"):
+                observation["dns_addresses"] = item["dns_addresses"]
             if observation not in entry["observations"]:
                 entry["observations"].append(observation)
     return [merged[name] for name in sorted(merged)]
