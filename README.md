@@ -113,7 +113,14 @@ python3 scripts/web-recon.py --hosts-file hosts.txt --port 443 \
 
 未指定 `--out-dir` 時，在目前目錄新建 `web-recon-YYYYMMDD-HHMMSS`，不覆寫舊執行。指定的輸出目錄須尚不存在。自動接續的狀態保存在 engagement 目錄的 `.web-recon/`；移動或刪除目前 run 後，可用 `--extend-run SOURCE` 指向仍存在的來源，或用 `--fresh` 開始新歷史。
 
-**先看 `report.md`**：它把各 hostname 的完成狀態、候選與證據連結整理在同一個檔案。候選過多時顯示前 30 筆，完整清單仍在對應的 `summary.json`。舊版已完成的 run 也能直接生成報表，無須重新送 request：
+**先看 run 目錄根層的 `report.md` 或 `report.json`**：`report.md` 整理狀態、候選與證據連結，候選過多時顯示前 30 筆；`report.json` 收齊所有 hostname 的完整結果，可直接用 `jq` 查詢，不必進入各 hostname 目錄找 `summary.json`。例如列出新 hostname 或 HTML comment：
+
+```bash
+jq -r '.hosts[].new_hosts[].name' web-recon-YYYYMMDD-HHMMSS/report.json
+jq -r '.hosts[].web[].pages[].comments[]' web-recon-YYYYMMDD-HHMMSS/report.json
+```
+
+舊版已完成的 run 也能直接生成這兩份報表，無須重新送 request：
 
 ```bash
 python3 -m webrecon.report ./runs/old-run
@@ -121,11 +128,12 @@ python3 -m webrecon.report ./runs/old-run
 
 ```text
 report.md                 整輪閱讀入口：狀態、候選、原始證據連結
+report.json               整輪完整結果：可用 jq 查詢
 run.json                  批次完成狀態
 progress.jsonl            即時 finding、各階段狀態與 ffuf 進度
 new-hosts.txt             可作下一輪 --hosts-file 輸入的候選 hostname
 new-hosts.jsonl           候選來源、起始 hostname 與起始 host 的實際連線 IP:port
-hosts/<hostname>-<hash>/summary.json
+hosts/<hostname>-<hash>/summary.json  續跑使用的每個 hostname 結果
 hosts/<hostname>-<hash>/responses/*.headers|*.body|*.meta|*.errors|*.jsonl
 hosts/<hostname>-<hash>/tls/
 hosts/<hostname>-<hash>/dns/

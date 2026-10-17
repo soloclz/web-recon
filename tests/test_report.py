@@ -140,6 +140,9 @@ class ReportTests(unittest.TestCase):
             report = report_module.report_existing_run(run_dir)
             self.assertEqual(report, (run_dir / "report.md").resolve())
             self.assertIn("## example.test:80", report.read_text())
+            data = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+            self.assertEqual(data["schema_version"], 1)
+            self.assertEqual(data["hosts"][0]["host"], host)
 
 
 if __name__ == "__main__":

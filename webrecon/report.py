@@ -1,4 +1,4 @@
-"""One readable entry point for a web-recon run.
+"""Readable and queryable entry points for a web-recon run.
 
 The report points to saved evidence. It never upgrades a candidate to a finding.
 """
@@ -210,6 +210,7 @@ def write_report(run_dir: Path, results: list[dict], source_run: Path | None = N
     run_dir.mkdir(parents=True, exist_ok=True)
     lines = ["# Web recon report", "",
              "Candidates below differ from missing-path or default-vhost controls, or came from named sources. Review the linked evidence before using them.", "",
+             "Full results: [report.json](report.json).", "",
              "## Hosts", ""]
     if any(result.get("extended_from") for result in results):
         lines[2:2] = ["Earlier hostname results and their referenced evidence are included in this run. The `This run` column shows which hosts were scanned or updated.", ""]
@@ -304,6 +305,17 @@ def write_report(run_dir: Path, results: list[dict], source_run: Path | None = N
     return report
 
 
+def write_json_report(run_dir: Path, results: list[dict], overview: dict) -> Path:
+    """Collect the saved host summaries in one queryable file at the run root."""
+    run_dir = Path(run_dir).resolve()
+    hosts = [json.loads((run_dir / _summary_path(result)).read_text(encoding="utf-8"))
+             for result in results]
+    report = run_dir / "report.json"
+    report.write_text(json.dumps({"schema_version": 1, "run": overview, "hosts": hosts},
+                                 indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return report
+
+
 def report_existing_run(run_dir: Path) -> Path:
     """Create a readable report from saved output without making requests."""
     run_dir = Path(run_dir).resolve()
@@ -317,7 +329,9 @@ def report_existing_run(run_dir: Path) -> Path:
             raise ValueError("run.json contains an invalid host entry")
         summary_path = run_dir / _summary_path(entry)
         results.append(json.loads(summary_path.read_text(encoding="utf-8")))
-    return write_report(run_dir, results)
+    report = write_report(run_dir, results)
+    write_json_report(run_dir, results, overview)
+    return report
 
 
 def main(argv: list[str] | None = None) -> int:

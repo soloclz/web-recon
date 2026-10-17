@@ -364,6 +364,7 @@ def extend_main(options) -> int:
                           wordlist_hashes=wordlist_hashes, settings=cli.scan_settings(options),
                           extended_from=source_run)
     print(f"Report: {run_dir / 'report.md'}", flush=True)
+    print(f"JSON: {run_dir / 'report.json'}", flush=True)
     print(run_dir)
     def successful(result: dict) -> bool:
         action = result.get("action")

@@ -258,6 +258,15 @@ class HttpCliTests(unittest.TestCase):
                          [("missing.htb", "error"), ("good.htb", "completed")])
         summaries = sorted((out_dir / "hosts").glob("*/summary.json"))
         self.assertEqual(len(summaries), 2)
+        report_data = json.loads((out_dir / "report.json").read_text(encoding="utf-8"))
+        self.assertEqual(report_data["run"], overview)
+        self.assertEqual([item["host"] for item in report_data["hosts"]],
+                         ["missing.htb", "good.htb"])
+        self.assertEqual(report_data["hosts"][0]["stages"]["resolution"]["status"], "error")
+        by_host = {item["host"]: item for item in
+                   (json.loads(path.read_text(encoding="utf-8")) for path in summaries)}
+        self.assertEqual(report_data["hosts"],
+                         [by_host["missing.htb"], by_host["good.htb"]])
         failed = next(json.loads(path.read_text(encoding="utf-8")) for path in summaries
                       if "missing.htb" in path.parent.name)
         self.assertEqual(failed["stages"]["resolution"]["status"], "error")

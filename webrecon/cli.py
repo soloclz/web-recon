@@ -352,8 +352,8 @@ def write_run_outputs(run_dir: Path, results: list[dict], port: int,
                       source_run: Path | None = None,
                       extended_from: Path | None = None,
                       rerun_stages: tuple[str, ...] = ()) -> None:
-    """Write the batch overview and one readable report after every host finishes."""
-    from .report import write_report
+    """Write the batch overview and both reports after every host finishes."""
+    from .report import write_json_report, write_report
 
     new_hosts: dict[str, dict] = {}
     processed_hosts = {result["host"] for result in results}
@@ -383,6 +383,7 @@ def write_run_outputs(run_dir: Path, results: list[dict], port: int,
     if extended_from is not None:
         overview["extended_from"] = str(extended_from)
     write_report(run_dir, results)
+    write_json_report(run_dir, results, overview)
     (run_dir / "run.json").write_text(json.dumps(overview, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
@@ -434,6 +435,7 @@ def _fresh_main(args: argparse.Namespace) -> int:
     write_run_outputs(run_dir, results, args.port, wordlists, wordlist_hashes=wordlist_hashes,
                       settings=scan_settings(args))
     print(f"Report: {run_dir / 'report.md'}", flush=True)
+    print(f"JSON: {run_dir / 'report.json'}", flush=True)
     print(run_dir)
     return 0 if all(item["status"] == "completed" for item in results) else 1
 

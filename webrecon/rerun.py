@@ -452,6 +452,7 @@ def rerun_main(options) -> int:
                       settings=settings,
                       source_run=source_run, rerun_stages=options.rerun_stages)
     print(f"Report: {run_dir / 'report.md'}", flush=True)
+    print(f"JSON: {run_dir / 'report.json'}", flush=True)
     print(run_dir)
     return 0 if all(item.get("rerun", {}).get("status") == "completed"
                     for item in results) else 1
