@@ -214,6 +214,7 @@ class HttpCliTests(unittest.TestCase):
         web_started = Event()
         vhost_started = Event()
         paths_started = Event()
+        rates = []
 
         def dns(*_):
             dns_started.set()
@@ -225,14 +226,16 @@ class HttpCliTests(unittest.TestCase):
             return {"status": "completed", "probes": {"http": {"usable": True}},
                     "origins": [(origin, make_response(origin + "/"))]}
 
-        def vhost(*_, progress=None):
+        def vhost(*_, progress=None, rate=None):
+            rates.append(rate)
             vhost_started.set()
             if progress is not None:
                 progress("vhost", 1, 2)
                 progress("vhost", 2, 2)
             return {"status": "completed", "candidates": []} if paths_started.wait(2) else {"status": "error"}
 
-        def paths(*_, progress=None):
+        def paths(*_, progress=None, rate=None):
+            rates.append(rate)
             paths_started.set()
             return {"status": "completed", "candidates": []} if vhost_started.wait(2) else {"status": "error"}
 
@@ -245,8 +248,10 @@ class HttpCliTests(unittest.TestCase):
              patch.object(cli, "run_paths", side_effect=paths), \
              patch.object(cli, "run_extensions", return_value={"status": "not_run"}):
             exit_code = cli.main(["--host", "box.htb", "--port", "8080",
-                                  "--out-dir", str(out_dir), "--scanner-workers", "2"])
+                                  "--out-dir", str(out_dir), "--scanner-workers", "2",
+                                  "--ffuf-rate", "7"])
         self.assertEqual(exit_code, 0)
+        self.assertEqual(rates, [7, 7])
         self.assertTrue(dns_started.is_set() and web_started.is_set())
         self.assertTrue(vhost_started.is_set() and paths_started.is_set())
         events = [json.loads(line) for line in (out_dir / "progress.jsonl").read_text().splitlines()]

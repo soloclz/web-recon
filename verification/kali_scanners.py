@@ -69,10 +69,14 @@ try:
                      "--paths-wordlist", str(paths),
                      "--extensions-wordlist", str(extensions),
                      "--scanner-workers", "2", "--max-extra-requests", "2",
+                     "--ffuf-rate", "7",
                      "--max-pages", "5", "--max-requests", "100",
                      "--out-dir", str(cli_out)])
     cli_summary = json.loads(next(cli_out.glob("hosts/*/summary.json")).read_text())
     cli_scanners = cli_summary["scanners"]["http"]
+    path_status = next((cli_out / "hosts").glob("*/scanners/http/paths/paths.status.json"))
+    path_argv = json.loads(path_status.read_text())["argv"]
+    assert path_argv[path_argv.index("-rate") + 1] == "7"
     assert all(not Path(path).is_absolute() for path in cli_scanners["paths"]["artifacts"])
     cli_events = [json.loads(line) for line in (cli_out / "progress.jsonl").read_text().splitlines()]
     rerun_outputs = {}

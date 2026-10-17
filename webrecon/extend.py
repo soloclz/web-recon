@@ -18,6 +18,11 @@ def _inherit_settings(options, overview: dict, summaries: list[dict]) -> None:
     saved = overview.get("scan_settings") or {}
     if not isinstance(saved, dict):
         raise ValueError("source run has invalid scan settings")
+    saved_rate = saved.get("ffuf_rate", cli.RATE)
+    if not isinstance(saved_rate, int) or isinstance(saved_rate, bool) or saved_rate < 1:
+        raise ValueError("source run has invalid ffuf rate")
+    if options.ffuf_rate is None:
+        options.ffuf_rate = saved_rate
     web = saved.get("web")
     if web is not None:
         if not isinstance(web, dict) or any(not isinstance(web.get(name), int)
@@ -310,6 +315,7 @@ def extend_main(options) -> int:
             raise ValueError(f"--{name.replace('_', '-')} is unavailable: {path}")
 
     run_dir = cli.create_run_dir(options.out_dir)
+    options.completed_run_dir = run_dir
     source_roots = rerun._source_roots(source_run)
     order = [result["host"] for result in summaries] + new_hosts
     print(f"Output: {run_dir}", flush=True)

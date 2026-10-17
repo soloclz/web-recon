@@ -29,11 +29,11 @@ _LABEL = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 _FFUF_PROGRESS = re.compile(rb":: Progress: \[(\d+)/(\d+)\]")
 
 
-def _scan_timeout(wordlist: Path) -> float:
+def _scan_timeout(wordlist: Path, rate: int | None = None) -> float:
     """Allow a rate-limited wordlist enough time to finish, with finite slack."""
     with wordlist.open("rb") as source:
         entries = sum(1 for line in source if line.strip() and not line.lstrip().startswith(b"#"))
-    return max(TIMEOUT, math.ceil(entries / RATE * 1.5))
+    return max(TIMEOUT, math.ceil(entries / (RATE if rate is None else rate) * 1.5))
 
 
 def _report(status: str, **more: object) -> dict:
@@ -213,6 +213,7 @@ def _scan(
     out_dir: Path, name: str, wordlist: Path, url: str, *,
     host_header: str | None = None,
     progress: Callable[[str, int, int], None] | None = None,
+    rate: int | None = None,
 ) -> tuple[list[dict], list[str], list[str], str]:
     output = out_dir / f"{name}.json"
     stdout = out_dir / f"{name}.stdout"
@@ -223,11 +224,14 @@ def _scan(
         args.append("-k")
     if host_header:
         args += ["-H", f"Host: {host_header}"]
-    args += ["-mc", "all", "-ac", "-rate", str(RATE), "-of", "json", "-o", str(output)]
+    effective_rate = RATE if rate is None else rate
+    if effective_rate < 1:
+        raise ValueError("ffuf rate must be positive")
+    args += ["-mc", "all", "-ac", "-rate", str(effective_rate), "-of", "json", "-o", str(output)]
     artifacts = [str(stdout), str(stderr), str(status_path)]
     diagnostics: list[str] = []
     try:
-        timeout = _scan_timeout(wordlist)
+        timeout = _scan_timeout(wordlist, effective_rate)
         if progress is None:
             completed = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, check=False)
             stdout.write_bytes(completed.stdout)
@@ -325,6 +329,7 @@ def _wordlist_check(wordlist: Path | None) -> str | None:
 def run_vhost(
     origin: str, host: str, wordlist: Path | None, out_dir: Path, *,
     progress: Callable[[str, int, int], None] | None = None,
+    rate: int | None = None,
 ) -> dict:
     """Fuzz only prefixes of the supplied hostname using HTTP Host."""
     if wordlist is None:
@@ -342,8 +347,10 @@ def run_vhost(
     if not _hostname(host):
         return _report("error", diagnostics=["invalid input hostname"])
     controls, artifacts, diagnostics = _save_controls(origin, out_dir, "vhost", host)
+    rate_arg = {"rate": rate} if rate is not None else {}
     hits, scan_artifacts, scan_diagnostics, status = _scan(
-        out_dir, "vhost", wordlist, f"{origin}/", host_header=f"FUZZ.{host}", progress=progress
+        out_dir, "vhost", wordlist, f"{origin}/", host_header=f"FUZZ.{host}", progress=progress,
+        **rate_arg,
     )
     artifacts.extend(scan_artifacts)
     diagnostics.extend(scan_diagnostics)
@@ -376,6 +383,7 @@ def run_vhost(
 def run_paths(
     origin: str, wordlist: Path | None, out_dir: Path, baseline: dict | None = None, *,
     progress: Callable[[str, int, int], None] | None = None,
+    rate: int | None = None,
 ) -> dict:
     """Scan the origin root without recursion."""
     if wordlist is None:
@@ -395,8 +403,9 @@ def run_paths(
     diagnostics: list[str] = []
     if not _stable_control_pair(controls):
         controls, artifacts, diagnostics = _save_controls(origin, out_dir, "path")
+    rate_arg = {"rate": rate} if rate is not None else {}
     hits, scan_artifacts, scan_diagnostics, status = _scan(
-        out_dir, "paths", wordlist, f"{origin}/FUZZ", progress=progress
+        out_dir, "paths", wordlist, f"{origin}/FUZZ", progress=progress, **rate_arg
     )
     artifacts.extend(scan_artifacts)
     diagnostics.extend(scan_diagnostics)
@@ -482,6 +491,7 @@ def run_extensions(
     baseline: dict | None = None,
     *,
     progress: Callable[[str, int, int], None] | None = None,
+    rate: int | None = None,
 ) -> dict:
     """Try known stems with extension words, then bounded names with observed extensions."""
     if ext_wordlist is None:
@@ -529,9 +539,11 @@ def run_extensions(
     control_warnings: set[str] = set()
     status = "completed"
     known_basename_status = "completed"
+    rate_arg = {"rate": rate} if rate is not None else {}
     for index, stem in enumerate(stems, 1):
         hits, new_artifacts, new_diagnostics, scan_status = _scan(
-            out_dir, f"extension-stem-{index}", normalized, f"{origin}/{stem}FUZZ", progress=progress
+            out_dir, f"extension-stem-{index}", normalized, f"{origin}/{stem}FUZZ",
+            progress=progress, **rate_arg,
         )
         artifacts.extend(new_artifacts)
         diagnostics.extend(new_diagnostics)
@@ -589,7 +601,7 @@ def run_extensions(
                 request_count += count
                 hits, new_artifacts, new_diagnostics, scan_status = _scan(
                     out_dir, f"extension-filenames-{index}", limited, f"{origin}/FUZZ{extension}",
-                    progress=progress,
+                    progress=progress, **rate_arg,
                 )
                 artifacts.extend(new_artifacts)
                 diagnostics.extend(new_diagnostics)
@@ -635,6 +647,7 @@ def run_extension_filenames(
     max_extra_requests: int = 100000,
     *,
     progress: Callable[[str, int, int], None] | None = None,
+    rate: int | None = None,
 ) -> dict:
     """Rescan only names for extensions confirmed by a previous run."""
     if not confirmed_extensions or max_extra_requests == 0:
@@ -661,6 +674,7 @@ def run_extension_filenames(
     controls_by_extension: dict[str, list[dict]] = {}
     request_count = 0
     status = "completed"
+    rate_arg = {"rate": rate} if rate is not None else {}
     for index, extension in enumerate(extensions, 1):
         allocation = max_extra_requests // len(extensions) + (index <= max_extra_requests % len(extensions))
         if allocation <= 0:
@@ -683,7 +697,7 @@ def run_extension_filenames(
             status = "error"
         hits, new_artifacts, new_diagnostics, scan_status = _scan(
             out_dir, f"extension-filenames-{index}", limited, f"{origin}/FUZZ{extension}",
-            progress=progress,
+            progress=progress, **rate_arg,
         )
         artifacts.extend(new_artifacts)
         diagnostics.extend(new_diagnostics)

@@ -1,4 +1,4 @@
-"""Check cumulative host scans and selective wordlist updates on Kali."""
+"""Check automatic host continuation and selective wordlist updates on Kali."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ try:
     main(["--host", "127.0.0.1", "--port", str(server.server_port),
           "--paths-wordlist", str(paths), "--out-dir", str(first)])
     second = root / "second"
-    main(["--extend-run", str(first), "--hosts-file", str(hosts),
+    main(["--hosts-file", str(hosts), "--port", str(server.server_port),
           "--out-dir", str(second)])
     actions = {item["host"]: item["action"] for item in json.loads(
         (second / "run.json").read_text())["hosts"]}
@@ -51,7 +51,7 @@ try:
 
     paths.write_text("two\n")
     third = root / "third"
-    main(["--extend-run", str(second), "--hosts-file", str(hosts),
+    main(["--hosts-file", str(hosts), "--port", str(server.server_port),
           "--out-dir", str(third)])
     actions = {item["host"]: item["action"] for item in json.loads(
         (third / "run.json").read_text())["hosts"]}

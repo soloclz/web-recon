@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .dns import run_dns
-from .fuzz import run_extensions, run_paths, run_vhost
+from .fuzz import RATE, run_extensions, run_paths, run_vhost
 from .http import HttpClient, get_tls_certificate, inspect_origin, probe_origins
 from .public import run_public_sources
 from .progress import ProgressReporter
@@ -26,6 +26,7 @@ WEB_LIMIT_NAMES = ("max_pages", "max_depth", "max_body_bytes", "max_requests")
 def scan_settings(options: argparse.Namespace) -> dict:
     return {"web": {name: getattr(options, name) for name in WEB_LIMIT_NAMES},
             "max_extra_requests": options.max_extra_requests,
+            "ffuf_rate": options.ffuf_rate if options.ffuf_rate is not None else RATE,
             "public_sources": options.public_sources}
 
 
@@ -207,7 +208,9 @@ def run_host(host: str, port: int, run_dir: Path, options: argparse.Namespace,
                 stage = f"scanner:{label}:{name}"
                 callback = (lambda scan, current, total:
                             progress.update(host, stage, scan, current, total)) if progress else None
-                return _run_stage(progress, host, stage, function, *args, progress=callback)
+                rate_arg = {"rate": options.ffuf_rate} if options.ffuf_rate != RATE else {}
+                return _run_stage(progress, host, stage, function, *args,
+                                  progress=callback, **rate_arg)
 
             scanner_results = {}
             workers = getattr(options, "scanner_workers", 1)
@@ -316,8 +319,8 @@ def write_run_outputs(run_dir: Path, results: list[dict], port: int,
             overview["only"] = rerun_stages[0]
     if extended_from is not None:
         overview["extended_from"] = str(extended_from)
-    (run_dir / "run.json").write_text(json.dumps(overview, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     write_report(run_dir, results)
+    (run_dir / "run.json").write_text(json.dumps(overview, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def parser() -> argparse.ArgumentParser:
@@ -331,6 +334,8 @@ def parser() -> argparse.ArgumentParser:
                               help="reuse a completed run and rerun stages selected by wordlist flags")
     source_group.add_argument("--extend-run", type=Path,
                               help="add hostnames to a completed run without rescanning finished hosts")
+    ap.add_argument("--fresh", action="store_true",
+                    help="start a new run history in this engagement directory")
     ap.add_argument("--only", choices=("prefixes", "paths", "extensions"),
                     help="optional explicit single stage for legacy reruns")
     ap.add_argument("--host-prefixes-wordlist", type=Path)
@@ -344,8 +349,32 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--max-requests", type=int, default=200)
     ap.add_argument("--max-extra-requests", type=int, default=100000)
     ap.add_argument("--scanner-workers", type=int, default=1,
-                    help="parallel ffuf stages per origin (1-3; each keeps its own 20 req/s cap)")
+                    help="parallel ffuf stages per origin (1-3; --ffuf-rate applies to each)")
+    ap.add_argument("--ffuf-rate", type=int,
+                    help="maximum HTTP requests per second for each ffuf process (default: 20)")
     return ap
+
+
+def _fresh_main(args: argparse.Namespace) -> int:
+    if args.ffuf_rate is None:
+        args.ffuf_rate = RATE
+    hosts = read_hosts(args.host, args.hosts_file)
+    wordlists = {name: str(getattr(args, name).resolve()) if getattr(args, name) else None
+                 for name in ("host_prefixes_wordlist", "paths_wordlist", "extensions_wordlist")}
+    wordlist_hashes = hash_wordlists(wordlists)
+    run_dir = create_run_dir(args.out_dir)
+    args.completed_run_dir = run_dir
+    print(f"Output: {run_dir}", flush=True)
+    results = []
+    with ProgressReporter(run_dir) as progress:
+        for host in hosts:
+            print(f"[{host}:{args.port}]", flush=True)
+            results.append(run_host(host, args.port, run_dir, args, progress))
+    write_run_outputs(run_dir, results, args.port, wordlists, wordlist_hashes=wordlist_hashes,
+                      settings=scan_settings(args))
+    print(f"Report: {run_dir / 'report.md'}", flush=True)
+    print(run_dir)
+    return 0 if all(item["status"] == "completed" for item in results) else 1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -390,47 +419,43 @@ def main(argv: list[str] | None = None) -> int:
         ap.error("--only requires --from-run")
     if args.extend_run is not None and args.host is None and args.hosts_file is None:
         ap.error("--extend-run requires --host or --hosts-file")
+    if args.fresh and (args.from_run is not None or args.extend_run is not None):
+        ap.error("--fresh cannot be combined with --from-run or --extend-run")
     if args.port is not None and not 1 <= args.port <= 65535:
         ap.error("--port must be between 1 and 65535")
     if args.max_pages < 1 or args.max_depth < 0 or args.max_body_bytes < 1024 or args.max_requests < 4 or args.max_extra_requests < 0:
         ap.error("request and crawl limits are invalid")
     if not 1 <= args.scanner_workers <= 3:
         ap.error("--scanner-workers must be between 1 and 3")
+    if args.ffuf_rate is not None and args.ffuf_rate < 1:
+        ap.error("--ffuf-rate must be positive")
     for name in ("host_prefixes_wordlist", "paths_wordlist", "extensions_wordlist"):
         path = getattr(args, name)
         if path is not None and not path.is_file():
             ap.error(f"--{name.replace('_', '-')} is not a file: {path}")
-    if args.from_run is not None:
-        from .rerun import rerun_main
-        try:
-            return rerun_main(args)
-        except (OSError, ValueError, RuntimeError) as exc:
-            ap.error(str(exc))
-    if args.extend_run is not None:
-        from .extend import extend_main
-        try:
-            return extend_main(args)
-        except (OSError, ValueError, RuntimeError) as exc:
-            ap.error(str(exc))
+    from .state import locked_scope, source_port
+    scope = args.out_dir.parent if args.out_dir is not None else Path.cwd()
     try:
-        hosts = read_hosts(args.host, args.hosts_file)
-        wordlists = {name: str(getattr(args, name).resolve()) if getattr(args, name) else None
-                     for name in ("host_prefixes_wordlist", "paths_wordlist", "extensions_wordlist")}
-        wordlist_hashes = hash_wordlists(wordlists)
-        run_dir = create_run_dir(args.out_dir)
+        source = args.from_run or args.extend_run
+        port = source_port(source) if source is not None else args.port
+        with locked_scope(scope, port) as state:
+            if args.from_run is not None:
+                from .rerun import rerun_main
+                code = rerun_main(args)
+            else:
+                if args.extend_run is None and not args.fresh:
+                    args.extend_run = state.select_source()
+                    if args.extend_run is not None:
+                        print(f"Continuing: {args.extend_run}", flush=True)
+                if args.extend_run is not None:
+                    from .extend import extend_main
+                    code = extend_main(args)
+                else:
+                    code = _fresh_main(args)
+            state.record(args.completed_run_dir)
+            return code
     except (OSError, ValueError, RuntimeError) as exc:
         ap.error(str(exc))
-    print(f"Output: {run_dir}", flush=True)
-    results = []
-    with ProgressReporter(run_dir) as progress:
-        for host in hosts:
-            print(f"[{host}:{args.port}]", flush=True)
-            results.append(run_host(host, args.port, run_dir, args, progress))
-    write_run_outputs(run_dir, results, args.port, wordlists, wordlist_hashes=wordlist_hashes,
-                      settings=scan_settings(args))
-    print(f"Report: {run_dir / 'report.md'}", flush=True)
-    print(run_dir)
-    return 0 if all(item["status"] == "completed" for item in results) else 1
 
 
 if __name__ == "__main__":

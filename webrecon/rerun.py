@@ -13,7 +13,7 @@ from .cli import (_add_candidates, _observed_basenames, _relative_artifacts,
                   hash_wordlists,
                   _run_stage, create_run_dir, normalize_host, write_run_outputs)
 from .dns import rerun_dns_words
-from .fuzz import run_extension_filenames, run_extensions, run_paths, run_vhost
+from .fuzz import RATE, run_extension_filenames, run_extensions, run_paths, run_vhost
 from .progress import ProgressReporter
 
 
@@ -323,7 +323,9 @@ def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
                 stage = f"scanner:{label}:{name}"
                 callback = lambda scan_name, current, total: progress.update(
                     host, stage, scan_name, current, total)
-                return _run_stage(progress, host, stage, func, *args, progress=callback)
+                rate_arg = {"rate": options.ffuf_rate} if options.ffuf_rate != RATE else {}
+                return _run_stage(progress, host, stage, func, *args,
+                                  progress=callback, **rate_arg)
 
             jobs = []
             if "prefixes" in stages and getattr(options, "rerun_vhost", True):
@@ -372,6 +374,8 @@ def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
                                   else public.get("status", "error"))
         if "paths" in stages or "extensions" in stages:
             result.setdefault("scan_settings", {})["max_extra_requests"] = options.max_extra_requests
+        if any(stage in stages for stage in ("prefixes", "paths", "extensions")):
+            result.setdefault("scan_settings", {})["ffuf_rate"] = options.ffuf_rate
         if "public" in stages:
             result.setdefault("scan_settings", {})["public_sources"] = True
         rerun_status = ("unavailable" if web_origins == 0 else
@@ -392,6 +396,11 @@ def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
 def rerun_main(options) -> int:
     source_run = options.from_run.resolve()
     overview, summaries = _read_source(source_run)
+    if options.ffuf_rate is None:
+        saved_rate = (overview.get("scan_settings") or {}).get("ffuf_rate", RATE)
+        if not isinstance(saved_rate, int) or isinstance(saved_rate, bool) or saved_rate < 1:
+            raise ValueError("source run has invalid ffuf rate")
+        options.ffuf_rate = saved_rate
     if options.host is not None:
         requested = normalize_host(options.host)
         source_hosts = [result["host"] for result in summaries]
@@ -425,6 +434,7 @@ def rerun_main(options) -> int:
     if options.paths_wordlist is not None:
         wordlist_hashes["extension_names_wordlist"] = current_hashes.get("extension_names_wordlist")
     run_dir = create_run_dir(options.out_dir)
+    options.completed_run_dir = run_dir
     source_roots = _source_roots(source_run)
     print(f"Output: {run_dir}", flush=True)
     results = []
@@ -433,11 +443,11 @@ def rerun_main(options) -> int:
             print(f"[{result['host']}:{result['port']}] rerun {', '.join(options.rerun_stages)}", flush=True)
             results.append(_run_one(result, source_run, run_dir, overview, options, progress,
                                     source_roots))
-    settings = overview.get("scan_settings")
-    if isinstance(settings, dict):
-        settings = deepcopy(settings)
-        if "paths" in options.rerun_stages or "extensions" in options.rerun_stages:
-            settings["max_extra_requests"] = options.max_extra_requests
+    saved_settings = overview.get("scan_settings")
+    settings = deepcopy(saved_settings) if isinstance(saved_settings, dict) else {}
+    if "paths" in options.rerun_stages or "extensions" in options.rerun_stages:
+        settings["max_extra_requests"] = options.max_extra_requests
+    settings["ffuf_rate"] = options.ffuf_rate
     write_run_outputs(run_dir, results, overview["port"], wordlists,
                       wordlist_hashes=wordlist_hashes,
                       settings=settings,

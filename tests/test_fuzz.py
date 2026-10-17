@@ -366,6 +366,27 @@ class FuzzTests(unittest.TestCase):
         status = json.loads((self.root / "out" / "vhost.status.json").read_text())
         self.assertEqual(status["timeout_seconds"], 75)
 
+    def test_custom_ffuf_rate_sets_command_and_timeout(self):
+        names = self.wordlist("names.txt", "admin\n" * 50)
+        observed = []
+
+        def scanner(argv, **kwargs):
+            observed.append((argv, kwargs["timeout"]))
+            Path(argv[argv.index("-o") + 1]).write_text('{"results": []}')
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), \
+             patch.object(fuzz, "TIMEOUT", 10), \
+             patch.object(fuzz.subprocess, "run", side_effect=scanner):
+            report = fuzz.run_paths("http://box.htb", names, self.root / "custom-rate",
+                                    baseline=PAIR, rate=2)
+
+        self.assertEqual(report["status"], "completed")
+        self.assertEqual(observed[0][0][observed[0][0].index("-rate") + 1], "2")
+        self.assertEqual(observed[0][1], 38)
+        status = json.loads((self.root / "custom-rate" / "paths.status.json").read_text())
+        self.assertEqual(status["timeout_seconds"], 38)
+
 
 if __name__ == "__main__":
     unittest.main()

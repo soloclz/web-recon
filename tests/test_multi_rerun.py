@@ -330,14 +330,17 @@ class MultiRerunTests(unittest.TestCase):
         extensions = self._wordlist("parallel-extensions.txt")
         both_started = threading.Barrier(2, timeout=5)
         thread_ids = {}
+        rates = {}
 
-        def path_scan(*_args, progress=None):
+        def path_scan(*_args, progress=None, rate=None):
             thread_ids["paths"] = threading.get_ident()
+            rates["paths"] = rate
             both_started.wait()
             return self._path_result()
 
-        def extension_scan(*_args, progress=None):
+        def extension_scan(*_args, progress=None, rate=None):
             thread_ids["extensions"] = threading.get_ident()
+            rates["extensions"] = rate
             both_started.wait()
             return self._extension_result()
 
@@ -350,18 +353,41 @@ class MultiRerunTests(unittest.TestCase):
                 "parallel-scanners",
                 "--paths-wordlist", str(paths),
                 "--extensions-wordlist", str(extensions),
-                "--scanner-workers", "2",
+                "--scanner-workers", "2", "--ffuf-rate", "6",
             )
         self.assertEqual(code, 0)
         paths_mock.assert_called_once()
         extensions_mock.assert_called_once()
         self.assertNotEqual(thread_ids["paths"], thread_ids["extensions"])
+        self.assertEqual(rates, {"paths": 6, "extensions": 6})
 
     def test_from_run_without_wordlist_rejects_before_creating_output(self):
         output = self.root / "no-flags"
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             cli.main(["--from-run", str(self.source), "--out-dir", str(output)])
         self.assertFalse(output.exists())
+
+    def test_legacy_source_saves_explicit_rate_for_later_auto_continuation(self):
+        paths = self._wordlist("new-paths.txt")
+        with (
+            patch.object(rerun, "run_paths", return_value=self._path_result()),
+            patch.object(rerun, "run_extension_filenames",
+                         return_value=self._extension_result()),
+        ):
+            code, updated, _ = self._run(
+                "legacy-rate", "--paths-wordlist", str(paths), "--ffuf-rate", "7")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads((updated / "run.json").read_text())[
+            "scan_settings"]["ffuf_rate"], 7)
+
+        next_run = self.root / "auto-after-legacy-rate"
+        with patch.object(cli, "run_host", side_effect=AssertionError("completed host rescanned")):
+            self.assertEqual(cli.main([
+                "--host", self.host, "--port", str(self.port),
+                "--out-dir", str(next_run)]), 0)
+        metadata = json.loads((next_run / "run.json").read_text())
+        self.assertEqual(metadata["scan_settings"]["ffuf_rate"], 7)
+        self.assertEqual(metadata["hosts"][0]["action"], "reused")
 
     def test_matching_host_and_port_are_accepted_as_redundant(self):
         paths = self._wordlist("paths.txt")
