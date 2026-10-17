@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .dns import run_dns
-from .fuzz import RATE, run_extensions, run_paths, run_vhost
+from .fuzz import run_extensions, run_paths, run_vhost
 from .http import HttpClient, get_tls_certificate, inspect_origin, probe_origins
 from .public import run_public_sources
 from .progress import ProgressReporter
@@ -26,7 +26,7 @@ WEB_LIMIT_NAMES = ("max_pages", "max_depth", "max_body_bytes", "max_requests")
 def scan_settings(options: argparse.Namespace) -> dict:
     return {"web": {name: getattr(options, name) for name in WEB_LIMIT_NAMES},
             "max_extra_requests": options.max_extra_requests,
-            "ffuf_rate": options.ffuf_rate if options.ffuf_rate is not None else RATE,
+            "ffuf_rate": options.ffuf_rate,
             "public_sources": options.public_sources}
 
 
@@ -208,7 +208,7 @@ def run_host(host: str, port: int, run_dir: Path, options: argparse.Namespace,
                 stage = f"scanner:{label}:{name}"
                 callback = (lambda scan, current, total:
                             progress.update(host, stage, scan, current, total)) if progress else None
-                rate_arg = {"rate": options.ffuf_rate} if options.ffuf_rate != RATE else {}
+                rate_arg = {"rate": options.ffuf_rate} if options.ffuf_rate is not None else {}
                 return _run_stage(progress, host, stage, function, *args,
                                   progress=callback, **rate_arg)
 
@@ -351,13 +351,11 @@ def parser() -> argparse.ArgumentParser:
     ap.add_argument("--scanner-workers", type=int, default=1,
                     help="parallel ffuf stages per origin (1-3; --ffuf-rate applies to each)")
     ap.add_argument("--ffuf-rate", type=int,
-                    help="maximum HTTP requests per second for each ffuf process (default: 20)")
+                    help="maximum HTTP requests per second for each ffuf process (omit for ffuf default)")
     return ap
 
 
 def _fresh_main(args: argparse.Namespace) -> int:
-    if args.ffuf_rate is None:
-        args.ffuf_rate = RATE
     hosts = read_hosts(args.host, args.hosts_file)
     wordlists = {name: str(getattr(args, name).resolve()) if getattr(args, name) else None
                  for name in ("host_prefixes_wordlist", "paths_wordlist", "extensions_wordlist")}

@@ -367,7 +367,7 @@ class MultiRerunTests(unittest.TestCase):
             cli.main(["--from-run", str(self.source), "--out-dir", str(output)])
         self.assertFalse(output.exists())
 
-    def test_legacy_source_saves_explicit_rate_for_later_auto_continuation(self):
+    def test_legacy_source_saves_explicit_rate_without_inheriting_it_later(self):
         paths = self._wordlist("new-paths.txt")
         with (
             patch.object(rerun, "run_paths", return_value=self._path_result()),
@@ -386,7 +386,7 @@ class MultiRerunTests(unittest.TestCase):
                 "--host", self.host, "--port", str(self.port),
                 "--out-dir", str(next_run)]), 0)
         metadata = json.loads((next_run / "run.json").read_text())
-        self.assertEqual(metadata["scan_settings"]["ffuf_rate"], 7)
+        self.assertIsNone(metadata["scan_settings"]["ffuf_rate"])
         self.assertEqual(metadata["hosts"][0]["action"], "reused")
 
     def test_matching_host_and_port_are_accepted_as_redundant(self):

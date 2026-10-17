@@ -249,9 +249,9 @@ class HttpCliTests(unittest.TestCase):
              patch.object(cli, "run_extensions", return_value={"status": "not_run"}):
             exit_code = cli.main(["--host", "box.htb", "--port", "8080",
                                   "--out-dir", str(out_dir), "--scanner-workers", "2",
-                                  "--ffuf-rate", "7"])
+                                  "--ffuf-rate", "20"])
         self.assertEqual(exit_code, 0)
-        self.assertEqual(rates, [7, 7])
+        self.assertEqual(rates, [20, 20])
         self.assertTrue(dns_started.is_set() and web_started.is_set())
         self.assertTrue(vhost_started.is_set() and paths_started.is_set())
         events = [json.loads(line) for line in (out_dir / "progress.jsonl").read_text().splitlines()]

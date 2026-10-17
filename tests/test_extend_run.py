@@ -122,7 +122,7 @@ class ExtendRunTests(unittest.TestCase):
         index.write_text(json.dumps(overview))
         return overview
 
-    def test_ffuf_rate_inherits_and_override_does_not_rescan_completed_host(self):
+    def test_omitted_ffuf_rate_does_not_inherit_and_override_reuses_completed_host(self):
         overview = self._keep_only_old()
         overview["scan_settings"] = {"ffuf_rate": 7}
         (self.source / "run.json").write_text(json.dumps(overview))
@@ -137,8 +137,8 @@ class ExtendRunTests(unittest.TestCase):
             code = cli.main(["--extend-run", str(self.source), "--host", self.fresh,
                              "--out-dir", str(output)])
         self.assertEqual(code, 0)
-        self.assertEqual(seen, [(self.fresh, 7)])
-        self.assertEqual(json.loads((output / "run.json").read_text())["scan_settings"]["ffuf_rate"], 7)
+        self.assertEqual(seen, [(self.fresh, None)])
+        self.assertIsNone(json.loads((output / "run.json").read_text())["scan_settings"]["ffuf_rate"])
 
         overridden = self.root / "rate-overridden"
         with patch.object(cli, "run_host", side_effect=AssertionError("completed host rescanned")):

@@ -13,7 +13,7 @@ from .cli import (_add_candidates, _observed_basenames, _relative_artifacts,
                   hash_wordlists,
                   _run_stage, create_run_dir, normalize_host, write_run_outputs)
 from .dns import rerun_dns_words
-from .fuzz import RATE, run_extension_filenames, run_extensions, run_paths, run_vhost
+from .fuzz import run_extension_filenames, run_extensions, run_paths, run_vhost
 from .progress import ProgressReporter
 
 
@@ -323,7 +323,7 @@ def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
                 stage = f"scanner:{label}:{name}"
                 callback = lambda scan_name, current, total: progress.update(
                     host, stage, scan_name, current, total)
-                rate_arg = {"rate": options.ffuf_rate} if options.ffuf_rate != RATE else {}
+                rate_arg = {"rate": options.ffuf_rate} if options.ffuf_rate is not None else {}
                 return _run_stage(progress, host, stage, func, *args,
                                   progress=callback, **rate_arg)
 
@@ -396,11 +396,6 @@ def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
 def rerun_main(options) -> int:
     source_run = options.from_run.resolve()
     overview, summaries = _read_source(source_run)
-    if options.ffuf_rate is None:
-        saved_rate = (overview.get("scan_settings") or {}).get("ffuf_rate", RATE)
-        if not isinstance(saved_rate, int) or isinstance(saved_rate, bool) or saved_rate < 1:
-            raise ValueError("source run has invalid ffuf rate")
-        options.ffuf_rate = saved_rate
     if options.host is not None:
         requested = normalize_host(options.host)
         source_hosts = [result["host"] for result in summaries]

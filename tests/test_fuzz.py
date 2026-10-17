@@ -105,6 +105,7 @@ class FuzzTests(unittest.TestCase):
         self.assertEqual([x["url"] for x in report["candidates"]], ["https://box.htb/admin"])
         self.assertEqual(report["candidates"][0]["assessment"], "different_from_missing_baseline")
         self.assertIn("https://box.htb/FUZZ", self.commands[0])
+        self.assertNotIn("-rate", self.commands[0])
 
     def test_paths_unstable_controls_keep_hits_uncertain(self):
         names = self.wordlist("paths.txt", "admin\n")
@@ -417,7 +418,7 @@ class FuzzTests(unittest.TestCase):
 
         with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), \
              patch.object(fuzz, "_save_controls", return_value=([BASELINE, BASELINE], [], [])), \
-             patch.object(fuzz, "RATE", 1), patch.object(fuzz, "TIMEOUT", 10), \
+             patch.object(fuzz, "TIMEOUT_ESTIMATED_RATE", 1), patch.object(fuzz, "TIMEOUT", 10), \
              patch.object(fuzz, "_run_with_progress", side_effect=stream):
             report = fuzz.run_vhost("http://box.htb", "box.htb", names, self.root / "out",
                                     progress=lambda *_: None)
@@ -447,6 +448,17 @@ class FuzzTests(unittest.TestCase):
         self.assertEqual(observed[0][1], 38)
         status = json.loads((self.root / "custom-rate" / "paths.status.json").read_text())
         self.assertEqual(status["timeout_seconds"], 38)
+
+    def test_explicit_twenty_is_passed_to_ffuf(self):
+        names = self.wordlist("names.txt", "admin\n")
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), \
+             patch.object(fuzz.subprocess, "run", side_effect=self.scanner({})):
+            report = fuzz.run_paths("http://box.htb", names, self.root / "explicit-twenty",
+                                    baseline=PAIR, rate=20)
+
+        self.assertEqual(report["status"], "completed")
+        command = self.commands[0]
+        self.assertEqual(command[command.index("-rate") + 1], "20")
 
 
 if __name__ == "__main__":

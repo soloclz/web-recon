@@ -63,6 +63,9 @@ try:
     path_scan = run_paths(origin, paths, root / "paths", progress=record_progress)
     ext_scan = run_extensions(origin, paths, extensions, ["index"], root / "extensions", 2,
                               progress=record_progress)
+    for status_file in (root / "vhost/vhost.status.json", root / "paths/paths.status.json",
+                        root / "extensions/extension-stem-1.status.json"):
+        assert "-rate" not in json.loads(status_file.read_text())["argv"]
     cli_out = root / "cli"
     cli_exit = main(["--host", "localhost", "--port", str(server.server_port),
                      "--host-prefixes-wordlist", str(prefixes),
@@ -100,6 +103,8 @@ try:
         if stage == "paths":
             assert summary["scanners"]["http"]["extensions"]["filename_rescan"]["status"] == "completed"
             assert summary["scanners"]["http"]["extensions"]["known_basename_status"] == "completed"
+            path_status = next(out.glob("hosts/*/scanners/http/paths/paths.status.json"))
+            assert "-rate" not in json.loads(path_status.read_text())["argv"]
         if stage == "extensions":
             assert ".php" in summary["scanners"]["http"]["extensions"]["confirmed_extensions"]
         if stage == "prefixes":

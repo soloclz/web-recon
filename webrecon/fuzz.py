@@ -21,7 +21,7 @@ from typing import Callable
 from urllib.parse import quote, urlsplit
 
 
-RATE = 20
+TIMEOUT_ESTIMATED_RATE = 20
 TIMEOUT = 60 * 60
 BODY_LIMIT = 1024 * 1024
 MAX_BASENAMES = 25
@@ -30,10 +30,10 @@ _FFUF_PROGRESS = re.compile(rb":: Progress: \[(\d+)/(\d+)\]")
 
 
 def _scan_timeout(wordlist: Path, rate: int | None = None) -> float:
-    """Allow a rate-limited wordlist enough time to finish, with finite slack."""
+    """Allow a wordlist enough time; an estimate does not limit ffuf speed."""
     with wordlist.open("rb") as source:
         entries = sum(1 for line in source if line.strip() and not line.lstrip().startswith(b"#"))
-    return max(TIMEOUT, math.ceil(entries / (RATE if rate is None else rate) * 1.5))
+    return max(TIMEOUT, math.ceil(entries / (TIMEOUT_ESTIMATED_RATE if rate is None else rate) * 1.5))
 
 
 def _progress_with_target(
@@ -236,14 +236,16 @@ def _scan(
         args.append("-k")
     if host_header:
         args += ["-H", f"Host: {host_header}"]
-    effective_rate = RATE if rate is None else rate
-    if effective_rate < 1:
+    if rate is not None and rate < 1:
         raise ValueError("ffuf rate must be positive")
-    args += ["-mc", "all", "-ac", "-rate", str(effective_rate), "-of", "json", "-o", str(output)]
+    args += ["-mc", "all", "-ac"]
+    if rate is not None:
+        args += ["-rate", str(rate)]
+    args += ["-of", "json", "-o", str(output)]
     artifacts = [str(stdout), str(stderr), str(status_path)]
     diagnostics: list[str] = []
     try:
-        timeout = _scan_timeout(wordlist, effective_rate)
+        timeout = _scan_timeout(wordlist, rate)
         if progress is None:
             completed = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, check=False)
             stdout.write_bytes(completed.stdout)

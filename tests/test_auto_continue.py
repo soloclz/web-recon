@@ -94,6 +94,8 @@ class AutoContinueTests(unittest.TestCase):
         hosts.write_text(f"{self.old}\n{self.new}\n", encoding="utf-8")
         self.assertEqual(self._invoke("--host", self.old, "--port", "8080",
                                       "--out-dir", str(first)), 0)
+        self.assertIsNone(json.loads((first / "run.json").read_text())[
+            "scan_settings"]["ffuf_rate"])
         self.assertEqual(self._invoke("--hosts-file", str(hosts), "--port", "8080",
                                       "--out-dir", str(second)), 0)
         self.assertEqual(self.scanned, [(self.old, 8080), (self.new, 8080)])
