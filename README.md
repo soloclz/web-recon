@@ -135,7 +135,7 @@ python3 ~/tools/web-recon/scripts/web-recon.py \
 
 The new hostname gets a full first scan. Previously scanned hosts are retained in the new report even if they are absent from the new hosts file. The new run copies referenced old evidence, so the new directory can be moved on its own. If a retry fails, the previous usable result stays in the report and the failed attempt is saved separately.
 
-Automatic continuation uses the current directory as the engagement scope. With `--out-dir PATH`, it uses `PATH`'s parent. The requested output directory must not exist. Different ports have separate histories. If multiple independent histories exist for the same port, choose one explicitly:
+Automatic continuation uses the current directory as the engagement scope. With `--out-dir PATH`, it uses `PATH`'s parent. The requested output directory must not exist. Different ports have separate histories. A small `.web-recon/` directory in that scope holds the current-run pointer and a per-port lock; it is internal state, not a report. If multiple independent histories exist for the same port, choose one explicitly:
 
 ```bash
 python3 ~/tools/web-recon/scripts/web-recon.py \
@@ -144,6 +144,7 @@ python3 ~/tools/web-recon/scripts/web-recon.py \
 ```
 
 `--extend-run` inherits the source port, wordlists, and scan limits unless you override them. A supplied `--port` must match the source. The source must be a completed run with a schema version 2 `report.json`.
+Runs created before schema version 2 cannot be used as a continuation source. Use `--fresh` to start a new history with this version.
 
 To scan everything again, including pages that may have changed on the server, start a new history and supply the wordlists again:
 
