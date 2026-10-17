@@ -23,6 +23,10 @@ python3 scripts/web-recon.py --hosts-file hosts.txt --port 443 \
 
 在同一個 engagement 目錄執行 `--host` 或 `--hosts-file` 加 `--port` 即可。第一次做完整初查；以後會自動沿用該 port 的前次結果，新的 hostname 才做完整初查，失敗的階段重試，字典路徑或內容改變時只更新對應階段。每輪仍建立新的 run 目錄與一份彙總 `report.md`。
 
+例如兩次都從 `~/engagements/test` 執行 `inlanefreight.htb:43873`：第一次用 `subdomains-top1million-5000.txt`，第二次只把 prefix 字典換成 `subdomains-top1million-110000.txt`，path 與 extension 字典保持相同。兩輪會在 `~/engagements/test` 各建立一個 `web-recon-YYYYMMDD-HHMMSS/`；第二輪開始時的 `Continuing:` 指向第一輪，`Output:` 指向新目錄。請看第二輪的 `report.md`，它整合沿用的結果和本輪結果；第一輪目錄仍保留。已沿用的原始證據會複製進新目錄，方便單獨搬走第二輪結果。
+
+換 prefix 字典時，ffuf vhost 會測**整份** `subdomains-top1million-110000.txt`，不會扣掉先前字典裡已測過的項目；DNS 可用時，Gobuster DNS 也會重新測整份字典。第二輪的 prefix 候選以新掃描結果為準，第一輪原始結果留在第一輪目錄。已完成且字典未變的 path、extension 和固定 Web 檢查沿用先前結果。第二次可以照樣傳相同的 path、extension 字典參數，也可以省略它們，工具會沿用前次設定。
+
 ```bash
 python3 scripts/web-recon.py --hosts-file hosts.txt --port 443
 ```
