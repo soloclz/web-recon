@@ -440,7 +440,7 @@ class ExtendRunTests(unittest.TestCase):
         summary_path = rerun._host_dir(self.source, self.old) / "summary.json"
         summary = json.loads(summary_path.read_text())
         summary["status"] = "partial"
-        summary["scan_settings"] = {"web": {"max_pages": 50, "max_depth": 2,
+        summary["scan_settings"] = {"web": {"max_pages": 100, "max_depth": 99,
                                               "max_body_bytes": 1024 * 1024,
                                               "max_requests": 200},
                                     "max_extra_requests": 100000, "public_sources": False}

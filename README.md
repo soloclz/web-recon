@@ -157,9 +157,9 @@ python3 ~/tools/web-recon/scripts/web-recon.py \
   --extensions-wordlist /usr/share/seclists/Discovery/Web-Content/web-extensions.txt
 ```
 
-`--fresh` does not inherit wordlists or limits. Supply each option you want for the new scan.
+`--fresh` does not inherit wordlists or limits. Supply each option you want for the new scan. To repeat only the fixed checks and crawl after changing crawl limits, use `--fresh` with the host and port but no wordlist flags. A continued run keeps its saved crawl limits, including limits saved by older tool versions.
 
-The tool can detect changed local wordlists and explicit limit changes. It cannot detect remote page changes without requesting the pages again. Changing `--max-pages`, `--max-depth`, `--max-body-bytes`, or `--max-requests` causes affected old hosts to repeat Web checks; changing only `--max-extra-requests` updates the extension stage. Changing only `--ffuf-rate` does not rerun a completed scan.
+The tool can detect changed local wordlists and explicit limit changes. It cannot detect remote page changes without requesting the pages again. Changing `--max-pages`, `--max-depth`, `--max-body-bytes`, or `--max-requests` causes affected old hosts to run a fresh host scan, including their configured wordlists; changing only `--max-extra-requests` updates the extension stage. Changing only `--ffuf-rate` does not rerun a completed scan.
 
 ### Force selected wordlist stages
 
@@ -195,7 +195,7 @@ For each resolvable hostname, the fixed checks:
 4. Query DNS records, PTR, SOA/NS, and a wildcard control. Try AXFR only when the input name is confirmed as a zone and its NS answers with an authoritative SOA. If a hosts entry makes Web access possible but DNS cannot answer for that zone, the DNS stage is `unavailable` while Web and vhost checks continue.
 5. Compare fixed-path and ffuf hits with missing-path or default-vhost controls. A baseline match is not treated as a discovery; scanner errors and incomplete results are saved separately.
 
-Default built-in Web limits are 50 crawled pages, depth 2, 1 MiB per saved body, and 200 built-in Web requests per host. URLs beyond a limit remain in the candidate list. `--max-requests` does not cap ffuf or Gobuster. Use `--max-pages`, `--max-depth`, `--max-body-bytes`, and `--max-requests` to change these limits.
+Default built-in Web limits are 100 crawled pages, depth 99, 1 MiB per saved body, and 200 built-in Web requests per host. Depth 99 lets a single chain use the 100-page budget. URLs beyond a limit remain in the candidate list, and the Web stage is marked `partial` with the applicable limit reason. `--max-requests` does not cap ffuf or Gobuster. Use `--max-pages`, `--max-depth`, `--max-body-bytes`, and `--max-requests` to change these limits. For a larger linear crawl, raise all three of `--max-pages`, `--max-depth`, and `--max-requests`.
 
 DNS and Web checks can overlap within a host. By default, ffuf vhost, path, and extension stages run one at a time per origin. `--scanner-workers 2` or `3` allows that many ffuf stages to run together. `--ffuf-rate 10` caps **each ffuf process** at 10 requests per second; with two workers the combined upper bound can reach about 20 requests per second. If omitted, no `-rate` option is sent to ffuf. The rate does not control Gobuster or the built-in Web checks. Set it again on any later run that executes new ffuf work.
 

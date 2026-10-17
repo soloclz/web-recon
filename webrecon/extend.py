@@ -141,7 +141,7 @@ def _web_ready(stage: dict, *, allow_bounded: bool) -> bool:
         return True
     if stage.get("status") != "partial" or not allow_bounded:
         return False
-    bounded = {"crawl_limit", "script_limit", "sitemap_limit", "request_limit"}
+    bounded = {"crawl_limit", "depth_limit", "script_limit", "sitemap_limit", "request_limit"}
     reasons = stage.get("partial_reasons")
     return isinstance(reasons, list) and bool(reasons) and set(reasons) <= bounded
 

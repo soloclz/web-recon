@@ -19,8 +19,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 from .extract import LinkParser, clean_url, empty_inventory, parse_html
 
-MAX_PAGES = 50
-MAX_DEPTH = 2
+MAX_PAGES = 100
+MAX_DEPTH = 99
 MAX_BODY = 1024 * 1024
 FIXED_PATHS = (
     "/robots.txt", "/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml",
@@ -524,12 +524,28 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
     page_queue: deque[tuple[str, int, Response | None]] = deque([(origin + "/", 0, root)])
     unique_robots_pages = [url for url in dict.fromkeys(robots_pages)
                            if url != origin + "/"]
+    seen_pages = set()
+    depth_limited = set()
+
+    def defer_at_depth(url: str) -> None:
+        nonlocal partial
+        if (url in seen_pages or url in depth_limited or
+                any(pending_url == url for pending_url, _, _ in page_queue)):
+            return
+        depth_limited.add(url)
+        partial = True
+        partial_reasons.add("depth_limit")
+        candidate_urls.append({"url": url, "source": "depth_limit"})
 
     def queue_robots_after_root(url: str) -> None:
-        if url == origin + "/" and max_depth >= 1:
+        if url != origin + "/":
+            return
+        if max_depth >= 1:
             page_queue.extend((item, 1, None) for item in unique_robots_pages)
+        else:
+            for item in unique_robots_pages:
+                defer_at_depth(item)
 
-    seen_pages = set()
     seen_scripts = set()
     while page_queue and len(pages) < max_pages:
         url, depth, cached = page_queue.popleft()
@@ -565,8 +581,11 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
         if response.location:
             target = _redirect_target(response.location, url, origin)
             if target and _map_urls(origin, target, "redirect", found_hosts,
-                                    candidate_urls, on_candidate) and depth < max_depth:
-                page_queue.append((target, depth + 1, None))
+                                    candidate_urls, on_candidate):
+                if depth < max_depth:
+                    page_queue.append((target, depth + 1, None))
+                else:
+                    defer_at_depth(target)
         if not _html_response(response):
             queue_robots_after_root(url)
             continue
@@ -611,8 +630,11 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
             if not target:
                 continue
             if _map_urls(origin, target, kind + "_link", found_hosts, candidate_urls,
-                         on_candidate) and depth < max_depth:
-                page_queue.append((target, depth + 1, None))
+                         on_candidate):
+                if depth < max_depth:
+                    page_queue.append((target, depth + 1, None))
+                else:
+                    defer_at_depth(target)
         for raw in parsed.scripts:
             target = clean_url(raw, reference_base)
             if not target:

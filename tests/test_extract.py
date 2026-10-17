@@ -190,6 +190,65 @@ class ExtractTests(unittest.TestCase):
                           item["source"] == "crawl_limit"},
                          {origin + "/next", origin + "/private"})
 
+    def test_link_at_depth_boundary_remains_an_unfetched_candidate(self):
+        origin = "http://box.htb:8080"
+        root = response(origin + "/", body=b'<html><a href="/one">One</a></html>')
+        linked_pages = {
+            "/one": b'<html><a href="/two">Two</a></html>',
+            "/two": b'<html><a href="/three">Three</a></html>',
+            "/three": b'<html><!-- clue --></html>',
+        }
+
+        def answer(url):
+            body = linked_pages.get(urlsplit(url).path)
+            return response(url, body=body) if body else response(url, status=404, body=b"missing")
+
+        client = FakeClient(answer)
+        result = http.inspect_origin(origin, root, client, max_pages=50, max_depth=2)
+        self.assertEqual([item["url"] for item in result["pages"]],
+                         [origin + "/", origin + "/one", origin + "/two"])
+        self.assertTrue(any(item["url"] == origin + "/three"
+                            for item in result["candidate_urls"]))
+        self.assertEqual(result["status"], "partial")
+        self.assertIn("depth_limit", result["partial_reasons"])
+        self.assertNotIn(origin + "/three", client.urls)
+
+    def test_default_crawl_reaches_clues_in_a_100_page_chain(self):
+        origin = "http://box.htb:8080"
+
+        def page_body(depth):
+            parts = ["<html>"]
+            if depth == 32:
+                parts.append("<!-- depth 32 clue -->")
+            if depth == 93:
+                parts.append("Contact alice@example.test")
+            if depth < 99:
+                parts.append(f'<a href="/page-{depth + 1}">Next</a>')
+            parts.append("</html>")
+            return "".join(parts).encode()
+
+        root = response(origin + "/", body=page_body(0))
+
+        def answer(url):
+            path = urlsplit(url).path
+            number = path.removeprefix("/page-")
+            if path.startswith("/page-") and number.isdecimal() and 1 <= int(number) <= 99:
+                return response(url, body=page_body(int(number)))
+            return response(url, status=404, body=b"missing")
+
+        client = FakeClient(answer)
+        result = http.inspect_origin(origin, root, client)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(len(result["pages"]), 100)
+        self.assertEqual(result["pages"][-1]["url"], origin + "/page-99")
+        self.assertEqual(result["inventory"]["comments"], [{
+            "value": "<!-- depth 32 clue -->", "source_url": origin + "/page-32",
+            "prefix": "saved-fixture"}])
+        self.assertEqual(result["inventory"]["emails"], [{
+            "value": "alice@example.test", "source_url": origin + "/page-93",
+            "prefix": "saved-fixture"}])
+        self.assertNotIn(origin + "/page-100", client.urls)
+
     def test_duplicate_robots_root_is_not_a_false_crawl_limit(self):
         origin = "http://box.htb:8080"
         root = response(origin + "/", body=b"<html>Start</html>")
