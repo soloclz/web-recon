@@ -93,14 +93,14 @@ class PortableRerunTests(unittest.TestCase):
         path.write_text("new\n")
         return path
 
-    def _run_paths(self, *_args, progress=None):
+    def _run_paths(self, *_args, progress=None, on_candidate=None):
         out_dir = _args[-1]
         artifact = self._artifact(out_dir / "new.json", "new path")
         return {"status": "completed", "artifacts": [str(artifact)], "candidates": [
             {"url": self.origin + "/new", "source": "ffuf_path", "status_code": 200,
              "assessment": "different_from_missing_baseline"}]}
 
-    def _run_filenames(self, *_args, progress=None):
+    def _run_filenames(self, *_args, progress=None, on_candidate=None):
         out_dir = _args[-2]
         artifact = self._artifact(out_dir / "new.json", "new filename")
         return {"status": "completed", "artifacts": [str(artifact)],
@@ -113,7 +113,7 @@ class PortableRerunTests(unittest.TestCase):
                 "queries": [{"stdout": str(stdout)}],
                 "candidates": [], "scanner": {"status": "completed"}}
 
-    def _run_vhost(self, *_args, progress=None):
+    def _run_vhost(self, *_args, progress=None, on_candidate=None):
         out_dir = _args[-1]
         artifact = self._artifact(out_dir / "new.json", "new vhost")
         return {"status": "completed", "artifacts": [str(artifact)], "candidates": []}

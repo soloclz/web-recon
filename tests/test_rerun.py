@@ -134,7 +134,7 @@ class RerunTests(unittest.TestCase):
 
     def test_extension_reuses_old_path_dictionary_and_saved_crawl(self):
         wordlist = self._wordlist("extensions.txt")
-        def extensions(origin, paths, ext, stems, *_args, progress=None):
+        def extensions(origin, paths, ext, stems, *_args, progress=None, on_candidate=None):
             self.assertEqual(origin, self.origin)
             self.assertEqual(paths, self.old_paths)
             self.assertEqual(ext, wordlist)

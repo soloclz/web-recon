@@ -214,7 +214,7 @@ class ExtendRunTests(unittest.TestCase):
             scanned.append(host)
             return self._scan_host(host, port, run_dir, options, progress)
 
-        def paths(origin, _wordlist, _out_dir, *, progress=None):
+        def paths(origin, _wordlist, _out_dir, *, progress=None, on_candidate=None):
             path_origins.append(origin)
             return {"status": "completed", "candidates": [], "artifacts": []}
 
@@ -406,7 +406,7 @@ class ExtendRunTests(unittest.TestCase):
         used_names = []
 
         def extensions_scan(_origin, names, _extensions, _observed, _directory,
-                            _max_requests, *, progress):
+                            _max_requests, *, progress, on_candidate=None):
             used_names.append(names)
             return {"status": "completed", "candidates": [], "artifacts": []}
 

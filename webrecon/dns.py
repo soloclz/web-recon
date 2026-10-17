@@ -13,7 +13,9 @@ import json
 import re
 import secrets
 import subprocess
+import threading
 from pathlib import Path
+from typing import Callable
 
 
 RECORD_TYPES = ("A", "AAAA", "CNAME", "MX", "TXT", "CAA", "SOA", "NS")
@@ -37,7 +39,8 @@ def _name(value: str) -> str:
     return value
 
 
-def _write_command(out_dir: Path, stem: str, args: list[str], timeout: int) -> dict:
+def _write_command(out_dir: Path, stem: str, args: list[str], timeout: int,
+                   on_stdout_line: Callable[[str], None] | None = None) -> dict:
     stdout_path = out_dir / f"{stem}.stdout.txt"
     stderr_path = out_dir / f"{stem}.stderr.txt"
     meta_path = out_dir / f"{stem}.json"
@@ -45,11 +48,57 @@ def _write_command(out_dir: Path, stem: str, args: list[str], timeout: int) -> d
                     "stdout": str(stdout_path), "stderr": str(stderr_path),
                     "meta": str(meta_path)}
     try:
-        completed = subprocess.run(args, capture_output=True, text=True,
-                                   errors="replace", timeout=timeout, check=False)
-        stdout = completed.stdout or ""
-        stderr = completed.stderr or ""
-        result["returncode"] = completed.returncode
+        if on_stdout_line is None:
+            completed = subprocess.run(args, capture_output=True, text=True,
+                                       errors="replace", timeout=timeout, check=False)
+            stdout = completed.stdout or ""
+            stderr = completed.stderr or ""
+            result["returncode"] = completed.returncode
+        else:
+            expired = threading.Event()
+            callback_error = None
+            with stdout_path.open("w", encoding="utf-8") as stdout_file, \
+                    stderr_path.open("w", encoding="utf-8") as stderr_file:
+                process = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                           stderr=stderr_file, text=True,
+                                           errors="replace", bufsize=1)
+
+                def stop_on_timeout() -> None:
+                    if process.poll() is None:
+                        expired.set()
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+
+                timer = threading.Timer(timeout, stop_on_timeout)
+                timer.daemon = True
+                timer.start()
+                try:
+                    assert process.stdout is not None
+                    for line in process.stdout:
+                        stdout_file.write(line)
+                        stdout_file.flush()
+                        try:
+                            on_stdout_line(line)
+                        except Exception as exc:
+                            callback_error = f"{type(exc).__name__}: {exc}"
+                            process.kill()
+                            break
+                    result["returncode"] = process.wait()
+                finally:
+                    timer.cancel()
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                    if process.stdout is not None:
+                        process.stdout.close()
+            stdout = stdout_path.read_text(encoding="utf-8")
+            stderr = stderr_path.read_text(encoding="utf-8")
+            result["timed_out"] = expired.is_set()
+            if callback_error is not None:
+                result["callback_error"] = callback_error
+                stderr += f"\nCandidate callback failed: {callback_error}\n"
     except subprocess.TimeoutExpired as exc:
         stdout = exc.stdout or b""
         stderr = exc.stderr or b""
@@ -63,7 +112,8 @@ def _write_command(out_dir: Path, stem: str, args: list[str], timeout: int) -> d
         stdout = ""
         stderr = f"{type(exc).__name__}: {exc}\n"
     result["status"] = ("timeout" if result["timed_out"] else
-                        "completed" if result["returncode"] == 0 else "error")
+                        "completed" if result["returncode"] == 0 and
+                        "callback_error" not in result else "error")
     stdout_path.write_text(stdout, encoding="utf-8")
     stderr_path.write_text(stderr, encoding="utf-8")
     meta_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
@@ -109,19 +159,53 @@ def _rr_data(parsed: dict, owner: str, rr_type: str) -> list[str]:
 
 
 def _add_candidate(candidates: dict[str, dict], name: str, source: str,
+                   on_candidate: Callable[[dict], None] | None = None,
                    **details: object) -> None:
     try:
         name = _name(name)
     except ValueError:
         return
+    is_new = name not in candidates
     candidate = candidates.setdefault(name, {"name": name, "source": source})
+    newly_sourced = is_new
     if candidate["source"] != source:
-        candidate.setdefault("other_sources", []).append(source)
+        sources = candidate.setdefault("other_sources", [])
+        newly_sourced = source not in sources
+        if newly_sourced:
+            sources.append(source)
     candidate.update(details)
+    if newly_sourced and on_candidate is not None:
+        on_candidate({"kind": "hostname", "source": source, "name": name,
+                      **details})
+
+
+def _read_gobuster_line(line: str, host: str, wildcard_addresses: set[str],
+                        candidates: dict[str, dict],
+                        on_candidate: Callable[[dict], None] | None) -> None:
+    found = _GOBUSTER_FOUND_RE.match(line)
+    if not found:
+        return
+    found_name = found.group(1).rstrip(".").lower()
+    if not found_name.endswith(f".{host}"):
+        return
+    address_text = found.group(2) or found.group(3) or ""
+    addresses = re.findall(r"(?:\d{1,3}\.){3}\d{1,3}|[0-9a-f:]{2,}",
+                           address_text, re.I)
+    candidate_addresses = []
+    for address in addresses:
+        try:
+            candidate_addresses.append(str(ipaddress.ip_address(address)))
+        except ValueError:
+            pass
+    _add_candidate(candidates, found_name, "gobuster_dns", on_candidate,
+                   addresses=candidate_addresses,
+                   wildcard_match=bool(candidate_addresses and
+                                       set(candidate_addresses) == wildcard_addresses))
 
 
 def run_dns(host: str, ips: list[str], prefix_wordlist: Path | None,
-            out_dir: Path) -> dict:
+            out_dir: Path,
+            on_candidate: Callable[[dict], None] | None = None) -> dict:
     """Query records, PTR, wildcard, confirmed-zone AXFR, and optional DNS words.
 
     Every subprocess receives an argument array. Parent names are checked only
@@ -146,12 +230,23 @@ def run_dns(host: str, ips: list[str], prefix_wordlist: Path | None,
         return result
 
     candidates: dict[str, dict] = {}
+    emitted_records: set[tuple[str, str, str]] = set()
 
-    def execute(stem: str, args: list[str], timeout: int = 12) -> dict:
-        run = _write_command(out_dir, stem, args, timeout)
+    def execute(stem: str, args: list[str], timeout: int = 12,
+                on_stdout_line: Callable[[str], None] | None = None) -> dict:
+        run = _write_command(out_dir, stem, args, timeout, on_stdout_line)
         result["queries"].append({key: value for key, value in run.items()
                                   if key != "output"})
         result["artifacts"].extend([run["stdout"], run["stderr"], run["meta"]])
+        if (on_candidate is not None and args[0] == "dig" and
+                not stem.startswith("dig-wildcard-")):
+            for rr in _parse_dig(run["output"])["answers"]:
+                key = (rr["name"], rr["type"], rr["data"])
+                if key not in emitted_records:
+                    emitted_records.add(key)
+                    on_candidate({"kind": "dns_record", "source": "dns_record",
+                                  "name": rr["name"], "record_type": rr["type"],
+                                  "value": rr["data"]})
         if run["returncode"] is None or run["returncode"] != 0:
             result["diagnostics"].append(
                 f"{stem}: timeout" if run["timed_out"] else
@@ -181,7 +276,7 @@ def run_dns(host: str, ips: list[str], prefix_wordlist: Path | None,
         parsed = _parse_dig(run["output"])
         for rr in parsed["answers"]:
             if rr["type"] == "PTR":
-                _add_candidate(candidates, rr["data"], "dns_ptr")
+                _add_candidate(candidates, rr["data"], "dns_ptr", on_candidate)
 
     usable = any(parsed["status"] == "NOERROR" and
                  any(rr["name"] == host for rr in parsed["answers"])
@@ -281,7 +376,7 @@ def run_dns(host: str, ips: list[str], prefix_wordlist: Path | None,
             for rr in _parse_dig(run["output"])["answers"]:
                 owner = rr["name"]
                 if owner != host and owner != zone_name and owner.endswith(f".{zone_name}"):
-                    _add_candidate(candidates, owner, "dns_axfr")
+                    _add_candidate(candidates, owner, "dns_axfr", on_candidate)
 
     if prefix_wordlist is not None:
         prefix_wordlist = Path(prefix_wordlist)
@@ -290,32 +385,19 @@ def run_dns(host: str, ips: list[str], prefix_wordlist: Path | None,
                 f"gobuster wordlist not found: {prefix_wordlist}")
             result["scanner"] = {"status": "error", "reason": "wordlist not found"}
         else:
+            def found_line(line: str) -> None:
+                _read_gobuster_line(line, host, wildcard_addresses,
+                                    candidates, on_candidate)
+
             run = execute("gobuster-dns", ["gobuster", "dns", "--domain", host,
-                                           "-w", str(prefix_wordlist)], timeout=600)
+                                           "-w", str(prefix_wordlist)], timeout=600,
+                          on_stdout_line=found_line if on_candidate else None)
             result["scanner"] = {"status": run["status"],
                                  "command": run["command"],
                                  "stdout": run["stdout"], "stderr": run["stderr"]}
-            for line in run["output"].splitlines():
-                found = _GOBUSTER_FOUND_RE.match(line)
-                if not found:
-                    continue
-                found_name = found.group(1).rstrip(".").lower()
-                if not found_name.endswith(f".{host}"):
-                    continue
-                address_text = found.group(2) or found.group(3) or ""
-                addresses = re.findall(r"(?:\d{1,3}\.){3}\d{1,3}|[0-9a-f:]{2,}",
-                                       address_text, re.I)
-                candidate_addresses = []
-                for address in addresses:
-                    try:
-                        candidate_addresses.append(str(ipaddress.ip_address(address)))
-                    except ValueError:
-                        pass
-                _add_candidate(candidates, found_name, "gobuster_dns",
-                               addresses=candidate_addresses,
-                               wildcard_match=bool(candidate_addresses and
-                                                   set(candidate_addresses) ==
-                                                   wildcard_addresses))
+            if on_candidate is None:
+                for line in run["output"].splitlines():
+                    found_line(line)
 
     result["candidates"] = list(candidates.values())
     scanner_failed = (prefix_wordlist is not None and
@@ -325,7 +407,8 @@ def run_dns(host: str, ips: list[str], prefix_wordlist: Path | None,
 
 
 def rerun_dns_words(previous_dns: dict, host: str, prefix_wordlist: Path | None,
-                    out_dir: Path) -> dict:
+                    out_dir: Path,
+                    on_candidate: Callable[[dict], None] | None = None) -> dict:
     """Replace only the Gobuster stage in a saved DNS result; never call dig.
 
     Fixed DNS queries, their artifacts, and PTR/AXFR candidates stay in the
@@ -400,9 +483,16 @@ def rerun_dns_words(previous_dns: dict, host: str, prefix_wordlist: Path | None,
             if any((out_dir / f"gobuster-dns.{suffix}").exists()
                    for suffix in ("stdout.txt", "stderr.txt", "json")):
                 raise FileExistsError(f"Gobuster artifacts already exist in {out_dir}")
+            wildcard_addresses = set(result["wildcard"].get("addresses", []))
+
+            def found_line(line: str) -> None:
+                _read_gobuster_line(line, host, wildcard_addresses,
+                                    fixed_candidates, on_candidate)
+
             run = _write_command(out_dir, "gobuster-dns",
                                  ["gobuster", "dns", "--domain", host,
-                                  "-w", str(prefix_wordlist)], 600)
+                                  "-w", str(prefix_wordlist)], 600,
+                                 on_stdout_line=found_line if on_candidate else None)
             result["queries"].append({key: value for key, value in run.items()
                                       if key != "output"})
             result["artifacts"].extend([run["stdout"], run["stderr"], run["meta"]])
@@ -413,27 +503,9 @@ def rerun_dns_words(previous_dns: dict, host: str, prefix_wordlist: Path | None,
             result["scanner"] = {"status": run["status"],
                                  "command": run["command"],
                                  "stdout": run["stdout"], "stderr": run["stderr"]}
-            wildcard_addresses = set(result["wildcard"].get("addresses", []))
-            for line in run["output"].splitlines():
-                found = _GOBUSTER_FOUND_RE.match(line)
-                if not found:
-                    continue
-                found_name = found.group(1).rstrip(".").lower()
-                if not found_name.endswith(f".{host}"):
-                    continue
-                address_text = found.group(2) or found.group(3) or ""
-                addresses = re.findall(r"(?:\d{1,3}\.){3}\d{1,3}|[0-9a-f:]{2,}",
-                                       address_text, re.I)
-                candidate_addresses = []
-                for address in addresses:
-                    try:
-                        candidate_addresses.append(str(ipaddress.ip_address(address)))
-                    except ValueError:
-                        pass
-                _add_candidate(fixed_candidates, found_name, "gobuster_dns",
-                               addresses=candidate_addresses,
-                               wildcard_match=bool(candidate_addresses and
-                                                   set(candidate_addresses) == wildcard_addresses))
+            if on_candidate is None:
+                for line in run["output"].splitlines():
+                    found_line(line)
 
     result["candidates"] = list(fixed_candidates.values())
     scanner_failed = (prefix_wordlist is not None and result["scanner"]["status"] != "completed")

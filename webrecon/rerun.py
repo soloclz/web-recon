@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from pathlib import Path
 
-from .cli import (_add_candidates, _observed_basenames, _relative_artifacts,
+from .cli import (_add_candidates, _candidate_callback, _observed_basenames, _relative_artifacts,
                   hash_wordlists,
                   _run_stage, create_run_dir, normalize_host, write_run_outputs)
 from .dns import rerun_dns_words
@@ -294,7 +294,8 @@ def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
             previous_dns = result.get("dns", {})
             updated_dns = _run_stage(progress, host, "dns-words", rerun_dns_words,
                                      previous_dns, host, options.host_prefixes_wordlist,
-                                     host_dir / "dns")
+                                     host_dir / "dns",
+                                     on_candidate=_candidate_callback(progress, host, "dns-words"))
             if "records" not in updated_dns and isinstance(previous_dns, dict):
                 # A scanner start or write failure must not erase saved dig evidence.
                 failure_diagnostics = updated_dns.get("diagnostics", [])
@@ -325,7 +326,9 @@ def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
                     host, stage, scan_name, current, total)
                 rate_arg = {"rate": options.ffuf_rate} if options.ffuf_rate is not None else {}
                 return _run_stage(progress, host, stage, func, *args,
-                                  progress=callback, **rate_arg)
+                                  progress=callback,
+                                  on_candidate=_candidate_callback(progress, host, stage),
+                                  **rate_arg)
 
             jobs = []
             if "prefixes" in stages and getattr(options, "rerun_vhost", True):
@@ -368,7 +371,8 @@ def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
         if "public" in stages:
             from .public import run_public_sources
             public = _run_stage(progress, host, "public", run_public_sources,
-                                host, host_dir / "public")
+                                host, host_dir / "public",
+                                on_candidate=_candidate_callback(progress, host, "public"))
             result["public_sources"] = public
             stage_statuses.append("completed" if public.get("status") == "unavailable"
                                   else public.get("status", "error"))

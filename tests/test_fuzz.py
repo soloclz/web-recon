@@ -292,6 +292,51 @@ class FuzzTests(unittest.TestCase):
         self.assertTrue(any("partial results" in text for text in report["diagnostics"]))
         self.assertTrue((self.root / "out" / "paths.json").is_file())
 
+    def test_streamed_hit_survives_timeout_without_final_json(self):
+        names = self.wordlist("paths.txt", "admin\n")
+        live = []
+        streamed = hit("YWRtaW4=", "http://box.htb/admin", length=500)
+
+        def scan(argv, name, stdout, stderr, progress, timeout, *, on_hit):
+            stdout.write_bytes(json.dumps(streamed).encode() + b"\n")
+            stderr.write_bytes(b":: Progress: [1/2]")
+            on_hit(streamed)
+            return None, True
+
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), \
+             patch.object(fuzz, "_run_with_progress", side_effect=scan):
+            report = fuzz.run_paths("http://box.htb", names, self.root / "out", baseline=PAIR,
+                                    on_candidate=live.append)
+
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(live, report["candidates"])
+        self.assertTrue(any("timed out" in item for item in report["diagnostics"]))
+        self.assertTrue(any("stdout hits retained: 1" in item for item in report["diagnostics"]))
+        self.assertEqual(fuzz._streamed_results(self.root / "out" / "paths.stdout")[0]["input"]["FUZZ"],
+                         "admin")
+        self.assertEqual(json.loads((self.root / "out" / "paths.status.json").read_text())["returncode"],
+                         None)
+
+    def test_invalid_final_json_recovers_complete_streamed_hits(self):
+        names = self.wordlist("paths.txt", "admin\n")
+        streamed = hit("YWRtaW4=", "http://box.htb/admin", length=500)
+
+        def scan(argv, name, stdout, stderr, progress, timeout, *, on_hit):
+            stdout.write_bytes(json.dumps(streamed).encode() + b"\nnot-json\n")
+            stderr.write_bytes(b"")
+            Path(argv[argv.index("-o") + 1]).write_text('{"results": [')
+            return 0, False
+
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), \
+             patch.object(fuzz, "_run_with_progress", side_effect=scan):
+            report = fuzz.run_paths("http://box.htb", names, self.root / "out", baseline=PAIR,
+                                    on_candidate=lambda *_: None)
+
+        self.assertEqual(report["status"], "error")
+        self.assertEqual(report["candidates"][0]["url"], "http://box.htb/admin")
+        self.assertTrue(any("invalid ffuf JSON" in item for item in report["diagnostics"]))
+        self.assertTrue((self.root / "out" / "paths.json").is_file())
+
     def test_https_uses_insecure_tls_and_incomplete_baseline_still_probes(self):
         names = self.wordlist("paths.txt", "admin\n")
         response = {
@@ -385,6 +430,136 @@ class FuzzTests(unittest.TestCase):
         self.assertEqual(events[-1][:3], ("paths", 2, 2))
         self.assertEqual((self.root / "out" / "paths.stdout").read_bytes(), b"raw stdout\n")
         self.assertIn(b"Progress: [2/2]", (self.root / "out" / "paths.stderr").read_bytes())
+
+    def test_live_path_hit_arrives_before_ffuf_exits_and_skips_baseline_and_duplicates(self):
+        names = self.wordlist("paths.txt", "admin\nmissing\n")
+        actual_popen = subprocess.Popen
+        active = []
+        events = []
+        release = self.root / "release"
+        streamed = [
+            hit("YWRtaW4=", "http://box.htb/admin", length=500),
+            hit("YWRtaW4=", "http://box.htb/admin", length=500),
+            hit("bWlzc2luZw==", "http://box.htb/missing", length=100, words=10, lines=2),
+        ]
+        final = [hit("admin", "http://box.htb/admin", length=500),
+                 hit("missing", "http://box.htb/missing", length=100, words=10, lines=2)]
+
+        def launch(argv, **kwargs):
+            self.assertIn("-json", argv)
+            output = Path(argv[argv.index("-o") + 1])
+            script = (
+                "import json,os,time; "
+                f"records={streamed!r}; "
+                f"result={final!r}; "
+                f"output={str(output)!r}; "
+                f"release={str(release)!r}; "
+                "[os.write(1,(json.dumps(row)+'\\n').encode()) for row in records]; "
+                "os.write(1,b'not-json\\n'); "
+                "deadline=time.monotonic()+3;\n"
+                "while not os.path.exists(release) and time.monotonic()<deadline:\n"
+                " time.sleep(.02)\n"
+                "open(output,'w').write(json.dumps({'results':result}))"
+            )
+            process = actual_popen([sys.executable, "-c", script], **kwargs)
+            active.append(process)
+            return process
+
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), \
+             patch.object(fuzz.subprocess, "Popen", side_effect=launch):
+            def receive(item):
+                events.append((item, active[-1].poll()))
+                release.write_text("continue", encoding="utf-8")
+
+            report = fuzz.run_paths(
+                "http://box.htb", names, self.root / "out", baseline=PAIR,
+                on_candidate=receive,
+            )
+
+        self.assertEqual(report["status"], "completed")
+        self.assertEqual(len(events), 1)
+        self.assertIsNone(events[0][1])
+        self.assertEqual(events[0][0], report["candidates"][0])
+        self.assertEqual(events[0][0]["url"], "http://box.htb/admin")
+        raw = (self.root / "out" / "paths.stdout").read_bytes()
+        self.assertEqual(raw.count(b'"url": "http://box.htb/admin"'), 2)
+        self.assertIn(b"not-json\n", raw)
+
+    def test_live_vhost_uses_rendered_host_from_ffuf_json(self):
+        names = self.wordlist("names.txt", "admin\n")
+        seen = []
+        streamed = hit("YWRtaW4=", "http://box.htb/", length=500)
+        streamed["host"] = "admin.box.htb"
+        final = hit("admin", "http://box.htb/", length=500)
+        final["host"] = "admin.box.htb"
+
+        def stream(argv, name, stdout, stderr, progress, timeout, *, on_hit):
+            self.assertIn("-json", argv)
+            on_hit(streamed)
+            Path(argv[argv.index("-o") + 1]).write_text(json.dumps({"results": [final]}))
+            stdout.write_bytes(b"")
+            stderr.write_bytes(b"")
+            return 0, False
+
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), \
+             patch.object(fuzz, "_save_controls", return_value=([BASELINE, BASELINE], [], [])), \
+             patch.object(fuzz, "_run_with_progress", side_effect=stream):
+            report = fuzz.run_vhost("http://box.htb", "box.htb", names, self.root / "out",
+                                    on_candidate=seen.append)
+
+        self.assertEqual(seen, report["candidates"])
+        self.assertEqual(seen[0]["hostname"], "admin.box.htb")
+
+    def test_live_extension_hits_use_extension_controls_in_both_phases(self):
+        extensions = self.wordlist("extensions.txt", "php\n")
+        paths = self.wordlist("paths.txt", "admin\n")
+        seen = []
+        results = {
+            "extension-stem-1": [hit(".php", "http://box.htb/index.php", length=400)],
+            "extension-filenames-1": [hit("admin", "http://box.htb/admin.php", length=450)],
+        }
+
+        def stream(argv, name, stdout, stderr, progress, timeout, *, on_hit):
+            self.assertIn("-json", argv)
+            for result in results[name]:
+                streamed = {**result, "input": {"FUZZ": "Y2FsaWJyYXRpb24="}}
+                on_hit(streamed)
+            Path(argv[argv.index("-o") + 1]).write_text(json.dumps({"results": results[name]}))
+            stdout.write_bytes(b"")
+            stderr.write_bytes(b"")
+            return 0, False
+
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), \
+             patch.object(fuzz, "_save_controls", return_value=([BASELINE, BASELINE], [], [])) as controls, \
+             patch.object(fuzz, "_run_with_progress", side_effect=stream):
+            report = fuzz.run_extensions("http://box.htb", paths, extensions, [],
+                                         self.root / "out", 1, on_candidate=seen.append)
+
+        self.assertEqual(seen, report["candidates"])
+        self.assertEqual([item["phase"] for item in seen], ["known_basename", "known_extension"])
+        self.assertEqual(controls.call_count, 1)
+
+    def test_live_extension_filename_rerun_reports_before_final_json(self):
+        paths = self.wordlist("paths.txt", "admin\n")
+        seen = []
+        result = hit("admin", "http://box.htb/admin.php", length=450)
+
+        def stream(argv, name, stdout, stderr, progress, timeout, *, on_hit):
+            self.assertIn("-json", argv)
+            on_hit({**result, "input": {"FUZZ": "YWRtaW4="}})
+            Path(argv[argv.index("-o") + 1]).write_text(json.dumps({"results": [result]}))
+            stdout.write_bytes(b"")
+            stderr.write_bytes(b"")
+            return 0, False
+
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), \
+             patch.object(fuzz, "_save_controls", return_value=([BASELINE, BASELINE], [], [])), \
+             patch.object(fuzz, "_run_with_progress", side_effect=stream):
+            report = fuzz.run_extension_filenames("http://box.htb", paths, [".php"],
+                                                  self.root / "out", 1, on_candidate=seen.append)
+
+        self.assertEqual(seen, report["candidates"])
+        self.assertEqual(seen[0]["phase"], "known_extension")
 
     def test_streaming_ffuf_timeout_retains_partial_streams(self):
         names = self.wordlist("paths.txt", "admin\n")

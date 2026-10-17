@@ -10,6 +10,7 @@ import ipaddress
 import json
 import re
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -123,7 +124,8 @@ def _wayback_candidates(data: object, host: str) -> list[dict[str, str]]:
     return candidates
 
 
-def run_public_sources(host: str, out_dir: Path) -> dict:
+def run_public_sources(host: str, out_dir: Path,
+                       on_candidate: Callable[[dict], None] | None = None) -> dict:
     """Collect bounded public-index candidates for the exact input host.
 
     ``status`` is completed if both indexes were read, error if either query
@@ -182,6 +184,9 @@ def run_public_sources(host: str, out_dir: Path) -> dict:
             item["status"] = "completed"
             item["count"] = len(candidates)
             result["candidates"].extend(candidates)
+            if on_candidate is not None:
+                for candidate in candidates:
+                    on_candidate(candidate)
             if source == "crt.sh" and len(candidates) >= MAX_CANDIDATES_PER_SOURCE:
                 item["truncated"] = True
                 result["diagnostics"].append("crt.sh candidate limit reached; more names may exist")

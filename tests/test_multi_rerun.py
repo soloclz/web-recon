@@ -332,13 +332,13 @@ class MultiRerunTests(unittest.TestCase):
         thread_ids = {}
         rates = {}
 
-        def path_scan(*_args, progress=None, rate=None):
+        def path_scan(*_args, progress=None, rate=None, on_candidate=None):
             thread_ids["paths"] = threading.get_ident()
             rates["paths"] = rate
             both_started.wait()
             return self._path_result()
 
-        def extension_scan(*_args, progress=None, rate=None):
+        def extension_scan(*_args, progress=None, rate=None, on_candidate=None):
             thread_ids["extensions"] = threading.get_ident()
             rates["extensions"] = rate
             both_started.wait()

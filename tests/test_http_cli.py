@@ -90,6 +90,67 @@ class HttpCliTests(unittest.TestCase):
         self.assertEqual(findings["/.env"]["assessment"], "candidate")
         self.assertEqual(len(result["baseline"]), 2)
 
+    def test_web_findings_stream_before_later_requests(self):
+        origin = "http://box.htb:8080"
+        root = make_response(origin + "/", body=(
+            b'<html><title>Portal</title><a href="/admin">admin</a>'
+            b'<a href="https://api.box.htb/">api</a>'
+            b'<form action="/login" method="post"><input type="hidden" name="csrf"></form>'
+            b'<!-- check /internal --></html>'))
+        emitted = []
+
+        def reply(url, _label):
+            path = urlsplit(url).path
+            if path.startswith("/web-recon-missing-"):
+                self.assertTrue(any(item.get("kind") == "title" and
+                                    item.get("title") == "Portal" for item in emitted))
+                self.assertTrue(any(item.get("kind") == "hostname" and
+                                    item.get("name") == "api.box.htb" for item in emitted))
+            if path == "/sitemap.xml":
+                self.assertIn({"kind": "fixed_path", "source": "fixed_path",
+                               "url": origin + "/robots.txt", "status_code": 200,
+                               "assessment": "candidate"}, emitted)
+            if path == "/robots.txt":
+                return make_response(url, body=b"Disallow: /private\n")
+            if path == "/.env":
+                return make_response(url, body=b"FIXTURE=value", content_type="text/plain")
+            return make_response(url, status=404, body=b"missing", content_type="text/plain")
+
+        result = http.inspect_origin(origin, root, FakeClient(reply), max_pages=1,
+                                     on_candidate=emitted.append)
+        self.assertIn({"kind": "url", "url": origin + "/private",
+                       "source": "robots_disallow"}, emitted)
+        self.assertIn({"kind": "hostname", "name": "api.box.htb",
+                       "source": "a_link"}, emitted)
+        self.assertIn({"kind": "title", "source": "html_title", "url": origin + "/",
+                       "title": "Portal"}, emitted)
+        self.assertIn({"kind": "field", "source": "html_field", "url": origin + "/",
+                       "tag": "input", "name": "csrf", "type": "hidden"}, emitted)
+        self.assertIn({"kind": "comment", "source": "html_comment", "url": origin + "/",
+                       "text": " check /internal "}, emitted)
+        self.assertTrue(any(item.get("kind") == "fixed_path" and
+                            item.get("url") == origin + "/.env" for item in emitted))
+        self.assertFalse(any(item.get("kind") == "fixed_path" and
+                             item.get("url") == origin + "/.git/HEAD" for item in emitted))
+        self.assertEqual(result["status"], "partial")
+
+    def test_guessed_source_map_is_not_announced_when_missing(self):
+        origin = "http://box.htb:8080"
+        root = make_response(origin + "/", body=b'<html><script src="/app.js"></script></html>')
+        emitted = []
+
+        def reply(url, _label):
+            if url == origin + "/app.js":
+                return make_response(url, body=b"console.log(1)",
+                                     content_type="application/javascript")
+            return make_response(url, status=404, body=b"missing", content_type="text/plain")
+
+        result = http.inspect_origin(origin, root, FakeClient(reply), max_pages=1,
+                                     on_candidate=emitted.append)
+        self.assertIn({"url": origin + "/app.js.map", "source": "javascript_source_map"},
+                      result["candidate_urls"])
+        self.assertFalse(any(item.get("url") == origin + "/app.js.map" for item in emitted))
+
     def test_crawl_page_bound_and_source_map_from_loaded_script(self):
         origin = "http://box.htb:8080"
         root = make_response(
@@ -175,7 +236,7 @@ class HttpCliTests(unittest.TestCase):
                 raise socket.gaierror("name not found")
             return ["192.0.2.5"]
 
-        def probe(host, port, _client):
+        def probe(host, port, _client, on_candidate=None):
             origin = f"http://{host}:{port}"
             return {"status": "completed", "probes": {"http": {"usable": True}},
                     "origins": [(origin, make_response(origin + "/"))]}
@@ -216,17 +277,17 @@ class HttpCliTests(unittest.TestCase):
         paths_started = Event()
         rates = []
 
-        def dns(*_):
+        def dns(*_, on_candidate=None):
             dns_started.set()
             return {"status": "completed", "candidates": []} if web_started.wait(2) else {"status": "error"}
 
-        def probe(host, port, _client):
+        def probe(host, port, _client, on_candidate=None):
             web_started.set()
             origin = f"http://{host}:{port}"
             return {"status": "completed", "probes": {"http": {"usable": True}},
                     "origins": [(origin, make_response(origin + "/"))]}
 
-        def vhost(*_, progress=None, rate=None):
+        def vhost(*_, progress=None, rate=None, on_candidate=None):
             rates.append(rate)
             vhost_started.set()
             if progress is not None:
@@ -234,7 +295,7 @@ class HttpCliTests(unittest.TestCase):
                 progress("vhost", 2, 2)
             return {"status": "completed", "candidates": []} if paths_started.wait(2) else {"status": "error"}
 
-        def paths(*_, progress=None, rate=None):
+        def paths(*_, progress=None, rate=None, on_candidate=None):
             rates.append(rate)
             paths_started.set()
             return {"status": "completed", "candidates": []} if vhost_started.wait(2) else {"status": "error"}

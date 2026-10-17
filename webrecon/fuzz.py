@@ -7,6 +7,8 @@ requests.  ffuf's own auto-calibration supplies an additional filter.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import http.client
 import json
 import math
@@ -177,20 +179,64 @@ def _extension_assessment(hit: dict, controls: list[dict]) -> str:
     return _assessment(hit, controls)
 
 
+def _normalize_stream_hit(hit: dict) -> dict:
+    """ffuf's newline-delimited output base64-encodes input words."""
+    inputs = hit.get("input")
+    if not isinstance(inputs, dict) or not isinstance(inputs.get("FUZZ"), str):
+        return hit
+    try:
+        word = base64.b64decode(inputs["FUZZ"], validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError, ValueError):
+        return hit
+    return {**hit, "input": {**inputs, "FUZZ": word}}
+
+
+def _streamed_results(stdout: Path) -> list[dict]:
+    """Recover complete ffuf hits if its final JSON file was not written."""
+    hits: list[dict] = []
+    try:
+        with stdout.open("rb") as source:
+            for line in source:
+                if len(line) > 1024 * 1024:
+                    continue
+                try:
+                    hit = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if isinstance(hit, dict) and "status" in hit and ("url" in hit or "host" in hit):
+                    hits.append(_normalize_stream_hit(hit))
+    except OSError:
+        pass
+    return hits
+
+
 def _run_with_progress(
     args: list[str], name: str, stdout: Path, stderr: Path,
     progress: Callable[[str, int, int], None],
     timeout: float,
+    on_hit: Callable[[dict], None] | None = None,
 ) -> tuple[int | None, bool]:
-    """Keep ffuf's raw streams and report the latest counter while it runs."""
+    """Keep raw streams while reading ffuf counters and newline-delimited hits."""
     timed_out = False
     with stdout.open("wb") as stdout_file, stderr.open("wb") as stderr_file:
         process = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=stdout_file, stderr=stderr_file)
         try:
-            with stderr.open("rb") as progress_file:
+            with stderr.open("rb") as progress_file, stdout.open("rb") as hits_file:
                 deadline = time.monotonic() + timeout
                 tail = b""
+                hit_tail = b""
                 last_count: tuple[int, int] | None = None
+
+                def dispatch(line: bytes) -> None:
+                    if on_hit is None:
+                        return
+                    try:
+                        hit = json.loads(line)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        return
+                    if isinstance(hit, dict) and "status" in hit and ("url" in hit or "host" in hit):
+                        on_hit(_normalize_stream_hit(hit))
+
                 while True:
                     remaining = deadline - time.monotonic()
                     if process.poll() is None and remaining > 0:
@@ -212,7 +258,18 @@ def _run_with_progress(
                                 progress(name, *count)
                                 last_count = count
                         tail = data[-64:]
+                    if on_hit is not None:
+                        while chunk := hits_file.read(64 * 1024):
+                            lines = (hit_tail + chunk).split(b"\n")
+                            hit_tail = lines.pop()
+                            for line in lines:
+                                dispatch(line)
+                            # A malformed or oversized record must not grow memory with the scan.
+                            if len(hit_tail) > 1024 * 1024:
+                                hit_tail = b""
                     if process.poll() is not None:
+                        if hit_tail:
+                            dispatch(hit_tail)
                         break
         finally:
             if process.poll() is None:
@@ -225,6 +282,7 @@ def _scan(
     out_dir: Path, name: str, wordlist: Path, url: str, *,
     host_header: str | None = None,
     progress: Callable[[str, int, int], None] | None = None,
+    on_hit: Callable[[dict], None] | None = None,
     rate: int | None = None,
 ) -> tuple[list[dict], list[str], list[str], str]:
     output = out_dir / f"{name}.json"
@@ -239,6 +297,8 @@ def _scan(
     if rate is not None and rate < 1:
         raise ValueError("ffuf rate must be positive")
     args += ["-mc", "all", "-ac"]
+    if on_hit is not None:
+        args += ["-json"]
     if rate is not None:
         args += ["-rate", str(rate)]
     args += ["-of", "json", "-o", str(output)]
@@ -246,13 +306,17 @@ def _scan(
     diagnostics: list[str] = []
     try:
         timeout = _scan_timeout(wordlist, rate)
-        if progress is None:
+        if progress is None and on_hit is None:
             completed = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout, check=False)
             stdout.write_bytes(completed.stdout)
             stderr.write_bytes(completed.stderr)
             returncode = completed.returncode
         else:
-            returncode, timed_out = _run_with_progress(args, name, stdout, stderr, progress, timeout)
+            streaming_progress = progress or (lambda *_: None)
+            stream_args = {"on_hit": on_hit} if on_hit is not None else {}
+            returncode, timed_out = _run_with_progress(
+                args, name, stdout, stderr, streaming_progress, timeout, **stream_args
+            )
             if timed_out:
                 diagnostics.append(f"{name}: ffuf timed out after {timeout:g} seconds")
     except OSError as exc:
@@ -270,7 +334,10 @@ def _scan(
                                        "timeout_seconds": timeout}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     if not output.exists():
         diagnostics.append(f"{name}: ffuf did not write JSON output")
-        return [], artifacts, diagnostics, "error"
+        hits = _streamed_results(stdout) if on_hit is not None else []
+        if hits:
+            diagnostics.append(f"{name}: stdout hits retained: {len(hits)}")
+        return hits, artifacts, diagnostics, "error"
     artifacts.append(str(output))
     try:
         parsed = json.loads(output.read_text(encoding="utf-8"))
@@ -279,7 +346,10 @@ def _scan(
             raise ValueError("results is not a list of objects")
     except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
         diagnostics.append(f"{name}: invalid ffuf JSON: {exc}")
-        return [], artifacts, diagnostics, "error"
+        hits = _streamed_results(stdout) if on_hit is not None else []
+        if hits:
+            diagnostics.append(f"{name}: stdout hits retained: {len(hits)}")
+        return hits, artifacts, diagnostics, "error"
     if returncode != 0:
         diagnostics.append(f"{name}: ffuf exited with status {returncode}; partial results retained")
         return hits, artifacts, diagnostics, "error"
@@ -332,6 +402,18 @@ def _hit_info(hit: dict, assessment: str) -> dict:
     }
 
 
+def _emit_live_candidate(
+    on_candidate: Callable[[dict], None] | None, seen: set[str], item: dict | None
+) -> None:
+    if on_candidate is None or item is None:
+        return
+    identity = item.get("hostname") or item.get("url")
+    if not isinstance(identity, str) or identity in seen:
+        return
+    seen.add(identity)
+    on_candidate(item)
+
+
 def _wordlist_check(wordlist: Path | None) -> str | None:
     if wordlist is None:
         return "not_run"
@@ -343,6 +425,7 @@ def _wordlist_check(wordlist: Path | None) -> str | None:
 def run_vhost(
     origin: str, host: str, wordlist: Path | None, out_dir: Path, *,
     progress: Callable[[str, int, int], None] | None = None,
+    on_candidate: Callable[[dict], None] | None = None,
     rate: int | None = None,
 ) -> dict:
     """Fuzz only prefixes of the supplied hostname using HTTP Host."""
@@ -362,9 +445,22 @@ def run_vhost(
         return _report("error", diagnostics=["invalid input hostname"])
     controls, artifacts, diagnostics = _save_controls(origin, out_dir, "vhost", host)
     rate_arg = {"rate": rate} if rate is not None else {}
+    seen_live: set[str] = set()
+
+    def live_hit(hit: dict) -> None:
+        prefix = _vhost_prefix(hit, host)
+        if not prefix or not _hostname(prefix):
+            return
+        assessment = _strict_assessment(hit, controls)
+        if assessment == "matches_missing_baseline":
+            return
+        item = {"hostname": f"{prefix}.{host}", "source": "ffuf_vhost", "origin": origin,
+                **_hit_info(hit, assessment)}
+        _emit_live_candidate(on_candidate, seen_live, item)
+
     hits, scan_artifacts, scan_diagnostics, status = _scan(
         out_dir, "vhost", wordlist, f"{origin}/", host_header=f"FUZZ.{host}", progress=progress,
-        **rate_arg,
+        **({"on_hit": live_hit} if on_candidate is not None else {}), **rate_arg,
     )
     artifacts.extend(scan_artifacts)
     diagnostics.extend(scan_diagnostics)
@@ -397,6 +493,7 @@ def run_vhost(
 def run_paths(
     origin: str, wordlist: Path | None, out_dir: Path, baseline: dict | None = None, *,
     progress: Callable[[str, int, int], None] | None = None,
+    on_candidate: Callable[[dict], None] | None = None,
     rate: int | None = None,
 ) -> dict:
     """Scan the origin root without recursion."""
@@ -418,8 +515,22 @@ def run_paths(
     if not _stable_control_pair(controls):
         controls, artifacts, diagnostics = _save_controls(origin, out_dir, "path")
     rate_arg = {"rate": rate} if rate is not None else {}
+    seen_live: set[str] = set()
+
+    def live_hit(hit: dict) -> None:
+        assessment = _strict_assessment(hit, controls)
+        if assessment == "matches_missing_baseline":
+            return
+        fuzz = _fuzz_input(hit)
+        url = hit.get("url") or (f"{origin}/{quote(fuzz, safe='/._-')}" if fuzz else None)
+        if not isinstance(url, str) or not url.startswith(f"{origin}/"):
+            return
+        _emit_live_candidate(on_candidate, seen_live,
+                             {"url": url, "source": "ffuf_path", **_hit_info(hit, assessment)})
+
     hits, scan_artifacts, scan_diagnostics, status = _scan(
-        out_dir, "paths", wordlist, f"{origin}/FUZZ", progress=progress, **rate_arg
+        out_dir, "paths", wordlist, f"{origin}/FUZZ", progress=progress,
+        **({"on_hit": live_hit} if on_candidate is not None else {}), **rate_arg
     )
     artifacts.extend(scan_artifacts)
     diagnostics.extend(scan_diagnostics)
@@ -505,6 +616,7 @@ def run_extensions(
     baseline: dict | None = None,
     *,
     progress: Callable[[str, int, int], None] | None = None,
+    on_candidate: Callable[[dict], None] | None = None,
     rate: int | None = None,
 ) -> dict:
     """Try known stems with extension words, then bounded names with observed extensions."""
@@ -554,10 +666,24 @@ def run_extensions(
     status = "completed"
     known_basename_status = "completed"
     rate_arg = {"rate": rate} if rate is not None else {}
+    seen_live: set[str] = set()
     for index, stem in enumerate(stems, 1):
+        def live_stem_hit(hit: dict) -> None:
+            extension = _rendered_extension(hit, origin, stem, extensions)
+            if extension not in extensions:
+                return
+            assessment = _extension_assessment(hit, extension_controls(extension))
+            if assessment == "matches_missing_baseline":
+                return
+            item = {"url": hit.get("url") or f"{origin}/{stem}{extension}",
+                    "extension": extension, "phase": "known_basename", "source": "ffuf_extension",
+                    **_hit_info(hit, assessment)}
+            _emit_live_candidate(on_candidate, seen_live, item)
+
         hits, new_artifacts, new_diagnostics, scan_status = _scan(
             out_dir, f"extension-stem-{index}", normalized, f"{origin}/{stem}FUZZ",
-            progress=_progress_with_target(progress, stem), **rate_arg,
+            progress=_progress_with_target(progress, stem),
+            **({"on_hit": live_stem_hit} if on_candidate is not None else {}), **rate_arg,
         )
         artifacts.extend(new_artifacts)
         diagnostics.extend(new_diagnostics)
@@ -613,9 +739,22 @@ def run_extensions(
                 if count == 0:
                     continue
                 request_count += count
+                def live_filename_hit(hit: dict) -> None:
+                    assessment = _extension_assessment(hit, extension_controls(extension))
+                    if assessment == "matches_missing_baseline":
+                        return
+                    word = _fuzz_input(hit)
+                    item = {
+                        "url": hit.get("url") or f"{origin}/{quote(word or '', safe='._-')}{extension}",
+                        "extension": extension, "phase": "known_extension", "source": "ffuf_extension",
+                        **_hit_info(hit, assessment),
+                    }
+                    _emit_live_candidate(on_candidate, seen_live, item)
+
                 hits, new_artifacts, new_diagnostics, scan_status = _scan(
                     out_dir, f"extension-filenames-{index}", limited, f"{origin}/FUZZ{extension}",
-                    progress=_progress_with_target(progress, extension), **rate_arg,
+                    progress=_progress_with_target(progress, extension),
+                    **({"on_hit": live_filename_hit} if on_candidate is not None else {}), **rate_arg,
                 )
                 artifacts.extend(new_artifacts)
                 diagnostics.extend(new_diagnostics)
@@ -661,6 +800,7 @@ def run_extension_filenames(
     max_extra_requests: int = 100000,
     *,
     progress: Callable[[str, int, int], None] | None = None,
+    on_candidate: Callable[[dict], None] | None = None,
     rate: int | None = None,
 ) -> dict:
     """Rescan only names for extensions confirmed by a previous run."""
@@ -689,6 +829,7 @@ def run_extension_filenames(
     request_count = 0
     status = "completed"
     rate_arg = {"rate": rate} if rate is not None else {}
+    seen_live: set[str] = set()
     for index, extension in enumerate(extensions, 1):
         allocation = max_extra_requests // len(extensions) + (index <= max_extra_requests % len(extensions))
         if allocation <= 0:
@@ -709,9 +850,22 @@ def run_extension_filenames(
         if not _stable_control_pair(controls):
             diagnostics.append(f"extension {extension}: missing or unstable control responses")
             status = "error"
+        def live_filename_hit(hit: dict) -> None:
+            assessment = _extension_assessment(hit, controls)
+            if assessment == "matches_missing_baseline":
+                return
+            word = _fuzz_input(hit)
+            item = {
+                "url": hit.get("url") or f"{origin}/{quote(word or '', safe='._-')}{extension}",
+                "extension": extension, "phase": "known_extension", "source": "ffuf_extension",
+                **_hit_info(hit, assessment),
+            }
+            _emit_live_candidate(on_candidate, seen_live, item)
+
         hits, new_artifacts, new_diagnostics, scan_status = _scan(
             out_dir, f"extension-filenames-{index}", limited, f"{origin}/FUZZ{extension}",
-            progress=_progress_with_target(progress, extension), **rate_arg,
+            progress=_progress_with_target(progress, extension),
+            **({"on_hit": live_filename_hit} if on_candidate is not None else {}), **rate_arg,
         )
         artifacts.extend(new_artifacts)
         diagnostics.extend(new_diagnostics)

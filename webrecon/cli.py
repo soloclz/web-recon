@@ -83,6 +83,59 @@ def _run_stage(reporter: ProgressReporter | None, host: str, stage: str,
     return result
 
 
+def _candidate_callback(reporter: ProgressReporter | None, host: str, stage: str):
+    if reporter is None:
+        return None
+
+    def publish(item: dict) -> None:
+        kind = item.get("kind", "")
+        source = item.get("source", stage)
+        status = "candidate"
+        if kind == "dns_record":
+            status = "observed"
+            detail = f"{item.get('name', '')} {item.get('record_type', '')} {item.get('value', '')}"
+        elif kind == "origin":
+            status = "observed"
+            detail = f"HTTP {item.get('status_code', '?')} {item.get('url', '')}"
+            if item.get("remote_ip"):
+                detail += f" ({item['remote_ip']})"
+        elif kind == "page":
+            status = "observed"
+            detail = f"HTTP {item.get('status_code', '?')} {item.get('url', '')}"
+            headers = [f"Server={item['server']}" if item.get("server") else "",
+                       f"X-Powered-By={item['x_powered_by']}" if item.get("x_powered_by") else "",
+                       f"cookies={','.join(item['cookie_names'])}" if item.get("cookie_names") else ""]
+            detail += " " + " ".join(value for value in headers if value) if any(headers) else ""
+        elif kind == "title":
+            status = "observed"
+            detail = f"{item.get('url', '')} title={item.get('title', '')}"
+        elif kind == "field":
+            status = "observed"
+            detail = f"{item.get('url', '')} {item.get('tag', 'field')}[{item.get('name', '')}]"
+            if item.get("type"):
+                detail += f" type={item['type']}"
+        elif kind == "comment":
+            status = "observed"
+            detail = f"{item.get('url', '')} comment={item.get('text', '')[:300]}"
+        elif kind == "hostname":
+            detail = item.get("name", "")
+            if item.get("wildcard_match"):
+                detail += " (matches wildcard DNS)"
+        else:
+            locator = item.get("url") or item.get("hostname") or item.get("name") or item.get("path") or item.get("value")
+            detail = str(locator or kind or item)
+            if item.get("status_code"):
+                detail = f"HTTP {item['status_code']} {detail}"
+            if item.get("method"):
+                detail += f" ({item['method'].upper()})"
+        assessment = item.get("assessment")
+        if assessment and assessment not in ("candidate", "different_from_missing_baseline"):
+            detail += f" [{assessment}]"
+        reporter.candidate(host, stage, item, f"{source}: {detail}", status=status)
+
+    return publish
+
+
 def _artifact_path(path: str, run_dir: Path) -> str:
     if not Path(path).is_absolute():
         return path
@@ -173,6 +226,9 @@ def run_host(host: str, port: int, run_dir: Path, options: argparse.Namespace,
         (host_dir / "summary.json").write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
         return result
     if progress is not None:
+        for ip in ips:
+            progress.candidate(host, "resolution", {"kind": "address", "source": "resolution", "ip": ip},
+                               ip, status="observed")
         progress.finish(host, "resolution", "completed")
     result["resolved_ips"] = ips
     result["stages"]["resolution"] = {"status": "completed", "addresses": ips}
@@ -180,15 +236,19 @@ def run_host(host: str, port: int, run_dir: Path, options: argparse.Namespace,
     client = HttpClient(host_dir / "responses", summary_script, options.max_body_bytes, options.max_requests)
     with ThreadPoolExecutor(max_workers=1) as dns_pool:
         dns_future = dns_pool.submit(_run_stage, progress, host, "dns", run_dns,
-                                     host, ips, options.host_prefixes_wordlist, host_dir / "dns")
-        scheme = _run_stage(progress, host, "scheme", probe_origins, host, port, client)
+                                     host, ips, options.host_prefixes_wordlist, host_dir / "dns",
+                                     on_candidate=_candidate_callback(progress, host, "dns"))
+        scheme = _run_stage(progress, host, "scheme", probe_origins, host, port, client,
+                            on_candidate=_candidate_callback(progress, host, "scheme"))
         result["stages"]["scheme"] = {key: value for key, value in scheme.items() if key != "origins"}
         result["tls"] = _run_stage(progress, host, "tls", get_tls_certificate,
-                                    host, port, host_dir / "tls")
+                                    host, port, host_dir / "tls",
+                                    on_candidate=_candidate_callback(progress, host, "tls"))
         for origin, root in scheme.get("origins", []):
             label = urlsplit(origin).scheme
             web = _run_stage(progress, host, f"web:{label}", inspect_origin,
-                             origin, root, client, options.max_pages, options.max_depth)
+                             origin, root, client, options.max_pages, options.max_depth,
+                             on_candidate=_candidate_callback(progress, host, f"web:{label}"))
             result["web"][label] = web
             scanner_dir = host_dir / "scanners" / label
             scanner_dir.mkdir(parents=True, exist_ok=True)
@@ -210,7 +270,9 @@ def run_host(host: str, port: int, run_dir: Path, options: argparse.Namespace,
                             progress.update(host, stage, scan, current, total)) if progress else None
                 rate_arg = {"rate": options.ffuf_rate} if options.ffuf_rate is not None else {}
                 return _run_stage(progress, host, stage, function, *args,
-                                  progress=callback, **rate_arg)
+                                  progress=callback,
+                                  on_candidate=_candidate_callback(progress, host, stage),
+                                  **rate_arg)
 
             scanner_results = {}
             workers = getattr(options, "scanner_workers", 1)
@@ -227,7 +289,8 @@ def run_host(host: str, port: int, run_dir: Path, options: argparse.Namespace,
                 name: scanner_results[name] for name, _, _ in scan_specs
             }
         result["public_sources"] = (_run_stage(progress, host, "public", run_public_sources,
-                                                host, host_dir / "public")
+                                                host, host_dir / "public",
+                                                on_candidate=_candidate_callback(progress, host, "public"))
                                     if options.public_sources else {"status": "not_run"})
         result["dns"] = dns_future.result()
         result["stages"]["dns"] = {"status": result["dns"]["status"]}

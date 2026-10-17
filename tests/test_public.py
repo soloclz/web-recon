@@ -10,6 +10,22 @@ from webrecon.public import run_public_sources
 
 
 class PublicSourcesTests(unittest.TestCase):
+    def test_first_source_emits_before_second_source_request(self):
+        emitted = []
+
+        def fetch(url):
+            if url.startswith("https://crt.sh/"):
+                return b'[{"name_value":"api.example.net"}]'
+            self.assertEqual(emitted, [{"kind": "hostname", "name": "api.example.net",
+                                        "source": "crt.sh"}])
+            return b'[["original"]]'
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch("webrecon.public._fetch", side_effect=fetch):
+            result = run_public_sources("example.net", Path(temp_dir),
+                                        on_candidate=emitted.append)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["candidates"], emitted)
+
     def test_candidates_are_scoped_and_no_discovered_host_is_requested(self):
         requested = []
         crt = [

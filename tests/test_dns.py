@@ -22,6 +22,106 @@ def dig_output(*records: str, status: str = "NOERROR", aa: bool = False) -> str:
 
 
 class DnsTest(unittest.TestCase):
+    def test_streamed_gobuster_candidate_arrives_before_process_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wordlist = root / "prefixes.txt"
+            wordlist.write_text("api\n", encoding="utf-8")
+            marker = root / "candidate-seen"
+            events = []
+            actual_popen = subprocess.Popen
+            script = (
+                "import pathlib, sys, time\n"
+                "marker = pathlib.Path(sys.argv[1])\n"
+                "print('Found: api.app.example.test [192.0.2.21]', flush=True)\n"
+                "for _ in range(100):\n"
+                "    if marker.exists(): sys.exit(0)\n"
+                "    time.sleep(0.02)\n"
+                "sys.exit(3)\n"
+            )
+
+            def fake_run(args, **_kwargs):
+                records = (["app.example.test. 300 IN A 192.0.2.20"]
+                           if args[1] == "app.example.test" and args[2] == "A" else [])
+                return subprocess.CompletedProcess(args, 0, dig_output(*records), "")
+
+            def fake_popen(args, **kwargs):
+                self.assertEqual("gobuster", args[0])
+                return actual_popen([sys.executable, "-u", "-c", script, str(marker)],
+                                    **kwargs)
+
+            def candidate(event):
+                events.append(event)
+                if event.get("source") == "gobuster_dns":
+                    raw = root / "dns" / "gobuster-dns.stdout.txt"
+                    self.assertIn("api.app.example.test", raw.read_text())
+                    marker.touch()
+
+            with patch.object(dns.subprocess, "run", side_effect=fake_run), \
+                    patch.object(dns.subprocess, "Popen", side_effect=fake_popen):
+                result = dns.run_dns("app.example.test", [], wordlist, root / "dns",
+                                     on_candidate=candidate)
+            self.assertEqual("completed", result["status"])
+            self.assertTrue(marker.exists())
+            self.assertIn({"kind": "dns_record", "source": "dns_record",
+                           "name": "app.example.test", "record_type": "A",
+                           "value": "192.0.2.20"}, events)
+            self.assertIn({"kind": "hostname", "source": "gobuster_dns",
+                           "name": "api.app.example.test",
+                           "addresses": ["192.0.2.21"],
+                           "wildcard_match": False}, events)
+            self.assertEqual("api.app.example.test",
+                             result["candidates"][0]["name"])
+            self.assertEqual("Found: api.app.example.test [192.0.2.21]\n",
+                             (root / "dns" / "gobuster-dns.stdout.txt").read_text())
+            self.assertTrue((root / "dns" / "gobuster-dns.json").exists())
+
+    def test_rerun_streams_only_new_gobuster_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wordlist = root / "prefixes.txt"
+            wordlist.write_text("new\n", encoding="utf-8")
+            marker = root / "rerun-candidate-seen"
+            actual_popen = subprocess.Popen
+
+            def fake_run(args, **_kwargs):
+                records = (["app.example.test. 300 IN A 192.0.2.20"]
+                           if args[1] == "app.example.test" and args[2] == "A" else [])
+                return subprocess.CompletedProcess(args, 0, dig_output(*records), "")
+
+            with patch.object(dns.subprocess, "run", side_effect=fake_run):
+                previous = dns.run_dns("app.example.test", [], None, root / "old")
+
+            script = (
+                "import pathlib, sys, time\n"
+                "marker = pathlib.Path(sys.argv[1])\n"
+                "print('Found: new.app.example.test [192.0.2.22]', flush=True)\n"
+                "for _ in range(100):\n"
+                "    if marker.exists(): sys.exit(0)\n"
+                "    time.sleep(0.02)\n"
+                "sys.exit(3)\n"
+            )
+            events = []
+
+            def fake_popen(args, **kwargs):
+                self.assertEqual("gobuster", args[0])
+                return actual_popen([sys.executable, "-u", "-c", script, str(marker)],
+                                    **kwargs)
+
+            def candidate(event):
+                events.append(event)
+                marker.touch()
+
+            with patch.object(dns.subprocess, "Popen", side_effect=fake_popen), \
+                    patch.object(dns.subprocess, "run", side_effect=AssertionError("dig repeated")):
+                result = dns.rerun_dns_words(previous, "app.example.test", wordlist,
+                                             root / "new", on_candidate=candidate)
+            self.assertEqual("completed", result["status"])
+            self.assertEqual(["new.app.example.test"],
+                             [item["name"] for item in result["candidates"]])
+            self.assertEqual("gobuster_dns", events[0]["source"])
+            self.assertTrue(marker.exists())
+
     def test_hosts_only_name_marks_dns_unavailable_and_keeps_raw_evidence(self) -> None:
         commands = []
 

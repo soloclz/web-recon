@@ -150,7 +150,7 @@ class AutoContinueTests(unittest.TestCase):
         words.write_text("admin\nlogin\n", encoding="utf-8")
         origins = []
 
-        def scan_paths(origin, _wordlist, _out_dir, *, progress=None):
+        def scan_paths(origin, _wordlist, _out_dir, *, progress=None, on_candidate=None):
             origins.append(origin)
             return {"status": "completed", "candidates": [], "artifacts": []}
 

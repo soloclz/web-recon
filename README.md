@@ -85,7 +85,17 @@ python3 scripts/web-recon.py --hosts-file hosts.txt --port 443 \
 
 根目錄的 `new-hosts.txt` 只列本輪結果中尚未作為輸入掃描的候選 hostname，可直接作下一輪的 `--hosts-file`；若使用自己累積的 hosts file，自動接續仍會排除已完成的 hostname。
 
-執行開始會印出輸出目錄。終端顯示各階段的開始、完成與耗時。`HTTP vhost scan 9,222/114,438 tried (8%), elapsed 7m43s` 表示 ffuf 在 HTTP vhost 階段已測 9,222 個字典項，共 114,438 個；8% 只代表這個階段的進度，7m43s 是已耗時間。`progress.jsonl` 同步保存事件與原始 stage 名稱，可在另一個 terminal 用 `tail -f <輸出目錄>/progress.jsonl` 查看。DNS 與 Web 檢查可同時進行。每個 origin 的 vhost、path、extension 掃描預設依序執行；加入 `--scanner-workers 2` 或 `3` 可同時跑最多 2 或 3 個 `ffuf` 階段。`--ffuf-rate 10` 將每個 `ffuf` 程序限制為最多 10 requests/s；若有 2 個 worker，合計上限可達 20 requests/s。未指定時不傳 `-rate`，由 ffuf 使用自己的預設速度。這個參數控制 vhost、path、extension 字典掃描，不控制 `gobuster dns` 或固定 Web 檢查。每次執行都由本次的 `--ffuf-rate` 決定新掃描或重試階段是否帶 `-rate`；已完成的階段沿用原始證據。ffuf 每個工作的 timeout 至少為 1 小時；大型字典會依項數估算延長，未指定 rate 時以 20 requests/s 估算時間，但不限制 ffuf 速度。實際 timeout 記在對應的 `*.status.json`。`--hosts-file` 的 hostname 仍逐一處理。
+執行開始會印出輸出目錄。tmux 等互動終端只用一行持續更新目前進度；找到線索時先清掉進度行，印出固定的一行結果，再恢復進度。例如：
+
+```text
+[app.example.test] candidate HTTP path scan: ffuf_path: HTTP 200 http://app.example.test:8080/admin
+[app.example.test] candidate DNS checks: gobuster_dns: api.app.example.test
+[app.example.test] HTTP vhost scan 9,222/114,438 tried (8%), elapsed 7m43s
+```
+
+`candidate` 是待查看的線索；`observed` 是直接讀到的 DNS record、可用 origin、網頁資訊等。ffuf 命中會先與 missing path／default vhost 對照；baseline 不穩定時，訊息會附 assessment。Gobuster 命中若符合 wildcard DNS 也會標出。Web 的固定路徑、robots／sitemap、crawl URL、其他 hostname、source map、TLS SAN，以及 `--public-sources` 的候選都會在取得時輸出。這些行不等整輪掃描完成；每輪最終判讀仍看 `report.md` 與原始 response。
+
+`progress.jsonl` 立即保存 `finding`、開始、進度和完成事件及原始 stage 名稱，可在另一個 terminal 用 `tail -f <輸出目錄>/progress.jsonl` 查看。非互動輸出會把進度各寫成一行。`HTTP vhost scan 9,222/114,438 tried (8%), elapsed 7m43s` 表示 ffuf 已測 9,222 個字典項，共 114,438 個；8% 只代表這個階段的進度，7m43s 是已耗時間。DNS 與 Web 檢查可同時進行。每個 origin 的 vhost、path、extension 掃描預設依序執行；加入 `--scanner-workers 2` 或 `3` 可同時跑最多 2 或 3 個 `ffuf` 階段。`--ffuf-rate 10` 將每個 `ffuf` 程序限制為最多 10 requests/s；若有 2 個 worker，合計上限可達 20 requests/s。未指定時不傳 `-rate`，由 ffuf 使用自己的預設速度。這個參數控制 vhost、path、extension 字典掃描，不控制 `gobuster dns` 或固定 Web 檢查。每次執行都由本次的 `--ffuf-rate` 決定新掃描或重試階段是否帶 `-rate`；已完成的階段沿用原始證據。ffuf 每個工作的 timeout 至少為 1 小時；大型字典會依項數估算延長，未指定 rate 時以 20 requests/s 估算時間，但不限制 ffuf 速度。實際 timeout 記在對應的 `*.status.json`。`--hosts-file` 的 hostname 仍逐一處理。
 
 `HTTP extension scan (known filename: index.*)` 表示用已知檔名 `index` 測 extension 字典，例如 `/index.php`。確認 extension 後，`HTTP extension scan (filename guesses: *.php)` 表示用 path 字典猜 `.php` 檔名，例如 `/admin.php`；進度分母是該階段的字典項數。
 
@@ -112,7 +122,7 @@ python3 -m webrecon.report ./runs/old-run
 ```text
 report.md                 整輪閱讀入口：狀態、候選、原始證據連結
 run.json                  批次完成狀態
-progress.jsonl            執行中的階段與 ffuf 進度
+progress.jsonl            即時 finding、各階段狀態與 ffuf 進度
 new-hosts.txt             可作下一輪 --hosts-file 輸入的候選 hostname
 new-hosts.jsonl           候選來源、起始 hostname 與起始 host 的實際連線 IP:port
 hosts/<hostname>-<hash>/summary.json

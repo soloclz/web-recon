@@ -15,6 +15,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 MAX_PAGES = 50
@@ -262,7 +263,8 @@ def parse_certificate_sans(certificate_text: str) -> list[str]:
     return sorted(found)
 
 
-def get_tls_certificate(host: str, port: int, out_dir: Path) -> dict:
+def get_tls_certificate(host: str, port: int, out_dir: Path,
+                        on_candidate: Callable[[dict], None] | None = None) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
         context = ssl.create_default_context()
@@ -284,6 +286,9 @@ def get_tls_certificate(host: str, port: int, out_dir: Path) -> dict:
         if proc.returncode != 0:
             raise ValueError(f"openssl x509 exited with status {proc.returncode}")
         sans = parse_certificate_sans(proc.stdout)
+        if on_candidate is not None:
+            for name in sans:
+                on_candidate({"kind": "hostname", "source": "tls_san", "name": name})
         return {"status": "completed", "san": sans, "certificate_verified": False,
                 "protocol": protocol,
                 "cipher": cipher[0] if cipher else None,
@@ -294,7 +299,8 @@ def get_tls_certificate(host: str, port: int, out_dir: Path) -> dict:
                 "artifacts": [str(out_dir / "certificate.errors")]}
 
 
-def probe_origins(host: str, port: int, client: HttpClient) -> dict:
+def probe_origins(host: str, port: int, client: HttpClient,
+                  on_candidate: Callable[[dict], None] | None = None) -> dict:
     probes = {}
     origins = []
     for scheme in ("http", "https"):
@@ -307,6 +313,9 @@ def probe_origins(host: str, port: int, client: HttpClient) -> dict:
                               "protocol_error": protocol_error}
             if usable:
                 origins.append((origin, response))
+                if on_candidate is not None:
+                    on_candidate({"kind": "origin", "source": "scheme_probe", "url": origin,
+                                  "status_code": response.status, "remote_ip": response.remote_ip})
         except BudgetExceeded as exc:
             probes[scheme] = {"status": "error", "diagnostics": [str(exc)]}
     return {"status": "completed" if origins else "unavailable", "probes": probes,
@@ -350,18 +359,77 @@ def _sitemap_locs(body: bytes, base: str) -> tuple[list[str], bool]:
 
 
 def _map_urls(origin: str, url: str, source: str, found_hosts: list[dict],
-              candidate_urls: list[dict]) -> bool:
+              candidate_urls: list[dict],
+              on_candidate: Callable[[dict], None] | None = None) -> bool:
     if same_origin(url, origin):
         candidate_urls.append({"url": url, "source": source})
+        if on_candidate is not None:
+            on_candidate({"kind": "url", "url": url, "source": source})
         return True
     hostname = urlsplit(url).hostname
     if hostname:
         found_hosts.append({"name": hostname, "source": source})
+        if on_candidate is not None:
+            on_candidate({"kind": "hostname", "name": hostname, "source": source})
     return False
 
 
+def _announce_root(origin: str, root: Response,
+                   on_candidate: Callable[[dict], None] | None) -> None:
+    """Show clues already available from the scheme probe before fixed checks."""
+    if on_candidate is None or root.exit_code or root.truncated:
+        return
+    public = root.public()
+    observed = {"kind": "page", "source": "crawl", "url": root.url,
+                "status_code": root.status}
+    for key in ("server", "x_powered_by", "cookie_names"):
+        if public[key]:
+            observed[key] = public[key]
+    on_candidate(observed)
+    if root.location:
+        target = clean_url(root.location, root.url)
+        if target:
+            _map_urls(origin, target, "redirect", [], [], on_candidate)
+    if (root.content_type not in ("text/html", "application/xhtml+xml") and
+            not root.body[:1024].lstrip().lower().startswith((b"<!doctype html", b"<html"))):
+        return
+    parsed = parse_html(root.body)
+    if parsed.title:
+        on_candidate({"kind": "title", "source": "html_title", "url": root.url,
+                      "title": parsed.title[:500]})
+    for field in parsed.fields[:100]:
+        on_candidate({"kind": "field", "source": "html_field", "url": root.url,
+                      **field})
+    for comment in parsed.comments[:100]:
+        if comment.strip():
+            on_candidate({"kind": "comment", "source": "html_comment", "url": root.url,
+                          "text": comment})
+    for form in parsed.forms:
+        action = clean_url(form.get("action") or root.url, root.url)
+        if action:
+            if same_origin(action, origin):
+                on_candidate({"kind": "url", "url": action, "source": "form_action",
+                              "method": (form.get("method") or "get").lower()})
+            else:
+                _map_urls(origin, action, "form_action", [], [], on_candidate)
+    for raw, kind in parsed.links:
+        target = clean_url(raw, root.url)
+        if target:
+            _map_urls(origin, target, kind + "_link", [], [], on_candidate)
+    for raw in parsed.scripts:
+        target = clean_url(raw, root.url)
+        if target:
+            _map_urls(origin, target, "script_src", [], [], on_candidate)
+    for comment in parsed.comments:
+        for match in re.findall(r"https?://[^\s<>\"']+", comment):
+            target = clean_url(match, root.url)
+            if target:
+                _map_urls(origin, target, "html_comment", [], [], on_candidate)
+
+
 def inspect_origin(origin: str, root: Response, client: HttpClient,
-                   max_pages: int = MAX_PAGES, max_depth: int = MAX_DEPTH) -> dict:
+                   max_pages: int = MAX_PAGES, max_depth: int = MAX_DEPTH,
+                   on_candidate: Callable[[dict], None] | None = None) -> dict:
     """Inspect one usable origin. Every fetched response has raw and JSONL evidence."""
     found_hosts: list[dict] = []
     candidate_urls: list[dict] = []
@@ -369,6 +437,7 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
     diagnostics: list[str] = []
     partial = False
     partial_reasons: set[str] = set()
+    _announce_root(origin, root, on_candidate)
     try:
         baselines = [client.fetch(origin + "/web-recon-missing-" + uuid.uuid4().hex, "missing-control")
                      for _ in range(2)]
@@ -395,6 +464,9 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
             continue
         result = {**response.public(), **compare_baseline(response, baselines)}
         fixed.append(result)
+        if result["assessment"] == "candidate" and on_candidate is not None:
+            on_candidate({"kind": "fixed_path", "source": "fixed_path", "url": url,
+                          "status_code": response.status, "assessment": result["assessment"]})
         if response.exit_code or response.truncated:
             partial = True
             partial_reasons.add("incomplete_body")
@@ -405,10 +477,12 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
         if path == "/robots.txt" and result["assessment"] == "candidate":
             sitemaps, disallowed = _robots_urls(response.body, url)
             for item in sitemaps:
-                if _map_urls(origin, item, "robots_sitemap", found_hosts, candidate_urls):
+                if _map_urls(origin, item, "robots_sitemap", found_hosts, candidate_urls,
+                             on_candidate):
                     sitemap_queue.append((item, 0))
             for item in disallowed:
-                _map_urls(origin, item, "robots_disallow", found_hosts, candidate_urls)
+                _map_urls(origin, item, "robots_disallow", found_hosts, candidate_urls,
+                          on_candidate)
     sitemap_results = []
     seen_sitemaps = set()
     while sitemap_queue and len(seen_sitemaps) < 10:
@@ -435,7 +509,8 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
         sitemap_results.append({"url": url, "assessment": assessment, "is_index": is_index,
                                 "loc_count_saved": len(locs), "prefix": response.prefix})
         for item in locs:
-            if _map_urls(origin, item, "sitemap", found_hosts, candidate_urls) and is_index and depth < 2:
+            if _map_urls(origin, item, "sitemap", found_hosts, candidate_urls,
+                         on_candidate) and is_index and depth < 2:
                 sitemap_queue.append((item, depth + 1))
     pages = []
     scripts = []
@@ -463,9 +538,20 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
             continue
         page = {"url": url, "depth": depth, **response.public()}
         pages.append(page)
+        if on_candidate is not None:
+            observed = {"kind": "page", "source": "crawl", "url": url,
+                        "status_code": response.status}
+            if page["server"]:
+                observed["server"] = page["server"]
+            if page["x_powered_by"]:
+                observed["x_powered_by"] = page["x_powered_by"]
+            if page["cookie_names"]:
+                observed["cookie_names"] = page["cookie_names"]
+            on_candidate(observed)
         if response.location:
             target = clean_url(response.location, url)
-            if target and _map_urls(origin, target, "redirect", found_hosts, candidate_urls) and depth < max_depth:
+            if target and _map_urls(origin, target, "redirect", found_hosts,
+                                    candidate_urls, on_candidate) and depth < max_depth:
                 page_queue.append((target, depth + 1, None))
         if response.content_type not in ("text/html", "application/xhtml+xml") and not response.body[:1024].lstrip().lower().startswith((b"<!doctype html", b"<html")):
             continue
@@ -474,31 +560,49 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
         page["forms"] = parsed.forms[:100]
         page["fields"] = parsed.fields[:100]
         page["comments"] = parsed.comments[:100]
+        if page["title"] and on_candidate is not None:
+            on_candidate({"kind": "title", "source": "html_title", "url": url,
+                          "title": page["title"]})
+        if on_candidate is not None:
+            for field in page["fields"]:
+                on_candidate({"kind": "field", "source": "html_field", "url": url,
+                              **field})
+            for comment in page["comments"]:
+                if comment.strip():
+                    on_candidate({"kind": "comment", "source": "html_comment",
+                                  "url": url, "text": comment})
         for form in parsed.forms:
             action = clean_url(form.get("action") or url, url)
             if action:
                 if same_origin(action, origin):
-                    candidate_urls.append({"url": action, "source": "form_action",
-                                           "method": (form.get("method") or "get").lower()})
+                    entry = {"url": action, "source": "form_action",
+                             "method": (form.get("method") or "get").lower()}
+                    candidate_urls.append(entry)
+                    if on_candidate is not None:
+                        on_candidate({"kind": "url", **entry})
                 else:
-                    _map_urls(origin, action, "form_action", found_hosts, candidate_urls)
+                    _map_urls(origin, action, "form_action", found_hosts, candidate_urls,
+                              on_candidate)
         for raw, kind in parsed.links:
             target = clean_url(raw, url)
             if not target:
                 continue
-            if _map_urls(origin, target, kind + "_link", found_hosts, candidate_urls) and depth < max_depth:
+            if _map_urls(origin, target, kind + "_link", found_hosts, candidate_urls,
+                         on_candidate) and depth < max_depth:
                 page_queue.append((target, depth + 1, None))
         for raw in parsed.scripts:
             target = clean_url(raw, url)
             if not target:
                 continue
-            if _map_urls(origin, target, "script_src", found_hosts, candidate_urls):
+            if _map_urls(origin, target, "script_src", found_hosts, candidate_urls,
+                         on_candidate):
                 seen_scripts.add(target)
         for comment in parsed.comments:
             for match in re.findall(r"https?://[^\s<>\"']+", comment):
                 target = clean_url(match, url)
                 if target:
-                    _map_urls(origin, target, "html_comment", found_hosts, candidate_urls)
+                    _map_urls(origin, target, "html_comment", found_hosts, candidate_urls,
+                              on_candidate)
     if page_queue:
         partial = True
         partial_reasons.add("crawl_limit")
@@ -526,7 +630,9 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
             parts = urlsplit(script_url)
             map_urls = [urlunsplit((parts.scheme, parts.netloc, parts.path + ".map", "", ""))]
         for map_url in map_urls[:2]:
-            if not map_url or not _map_urls(origin, map_url, "javascript_source_map", found_hosts, candidate_urls):
+            if not map_url or not _map_urls(
+                    origin, map_url, "javascript_source_map", found_hosts, candidate_urls,
+                    on_candidate if not same_origin(map_url, origin) else None):
                 continue
             try:
                 map_response = client.fetch(map_url, "source-map")
@@ -546,6 +652,10 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
                     result["sources"] = list(map_data.get("sources", []))[:500] if isinstance(map_data, dict) else []
                 except (ValueError, TypeError):
                     result["sources"] = []
+                if on_candidate is not None:
+                    on_candidate({"kind": "source_map", "source": "javascript_source_map",
+                                  "url": map_url, "status_code": map_response.status,
+                                  "sources": result["sources"]})
             source_maps.append(result)
     if len(seen_scripts) > 20 or sitemap_queue:
         partial = True
