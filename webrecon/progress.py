@@ -34,10 +34,13 @@ def _display_stage(stage: str, scan: str | None) -> str:
                 "extension-filenames": "filename"}.get(purpose, purpose)
         label = f"{scheme.upper()} {name} scan"
         if scan and scan != purpose:
-            if scan.startswith("extension-stem-") and scan.removeprefix("extension-stem-").isdigit():
-                detail = f"known filename #{scan.removeprefix('extension-stem-')}"
-            elif scan.startswith("extension-filenames-") and scan.removeprefix("extension-filenames-").isdigit():
-                detail = f"filename guesses #{scan.removeprefix('extension-filenames-')}"
+            scan_name, _, target = scan.partition(":")
+            stem_number = scan_name.removeprefix("extension-stem-")
+            filename_number = scan_name.removeprefix("extension-filenames-")
+            if scan_name.startswith("extension-stem-") and stem_number.isdigit():
+                detail = f"known filename: {target}.*" if target else f"known filename #{stem_number}"
+            elif scan_name.startswith("extension-filenames-") and filename_number.isdigit():
+                detail = f"filename guesses: *{target}" if target else f"filename guesses #{filename_number}"
             else:
                 detail = scan
             label += f" ({detail})"

@@ -28,11 +28,25 @@ class ProgressTests(unittest.TestCase):
             output = io.StringIO()
             with patch("sys.stderr", output), ProgressReporter(Path(directory)) as progress:
                 progress.start("box.htb", "scanner:https:extensions")
-                progress.update("box.htb", "scanner:https:extensions", "extension-stem-1", 2, 10)
-                progress.update("box.htb", "scanner:https:extensions", "extension-filenames-1", 1, 50)
+                progress.update("box.htb", "scanner:https:extensions", "extension-stem-1:index", 2, 10)
+                progress.update("box.htb", "scanner:https:extensions", "extension-filenames-1:.php", 1, 50)
 
-            self.assertIn("HTTPS extension scan (known filename #1)", output.getvalue())
-            self.assertIn("HTTPS extension scan (filename guesses #1)", output.getvalue())
+            self.assertIn("HTTPS extension scan (known filename: index.*)", output.getvalue())
+            self.assertIn("HTTPS extension scan (filename guesses: *.php)", output.getvalue())
+            self.assertNotIn("#1", output.getvalue())
+            events = [json.loads(line) for line in (Path(directory) / "progress.jsonl").read_text().splitlines()]
+            scans = [event["scan"] for event in events if event["event"] == "progress"]
+            self.assertEqual(scans, ["extension-stem-1:index", "extension-filenames-1:.php"])
+
+    def test_filename_only_rerun_displays_confirmed_extension(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = io.StringIO()
+            with patch("sys.stderr", output), ProgressReporter(Path(directory)) as progress:
+                progress.start("box.htb", "scanner:http:extension-filenames")
+                progress.update("box.htb", "scanner:http:extension-filenames",
+                                "extension-filenames-1:.php", 3, 10)
+
+            self.assertIn("HTTP filename scan (filename guesses: *.php)", output.getvalue())
 
 
 if __name__ == "__main__":

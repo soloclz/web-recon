@@ -157,7 +157,7 @@ try:
     assert any(x["url"].endswith("/admin.php") and x["phase"] == "known_extension"
                for x in ext_scan["candidates"])
     assert ext_scan["extra_request_count"] == 2
-    assert {"vhost", "paths", "extension-stem-1", "extension-filenames-1"}.issubset(
+    assert {"vhost", "paths", "extension-stem-1:index", "extension-filenames-1:.php"}.issubset(
         evidence["progress"]
     )
     assert cli_exit in (0, 1) and cli_summary["dns"]["status"] in {"partial", "unavailable", "completed"}

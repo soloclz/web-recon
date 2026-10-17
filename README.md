@@ -83,6 +83,8 @@ python3 scripts/web-recon.py --hosts-file hosts.txt --port 443 \
 
 執行開始會印出輸出目錄。終端顯示各階段的開始、完成與耗時。`HTTP vhost scan 9,222/114,438 tried (8%), elapsed 7m43s` 表示 ffuf 在 HTTP vhost 階段已測 9,222 個字典項，共 114,438 個；8% 只代表這個階段的進度，7m43s 是已耗時間。`progress.jsonl` 同步保存事件與原始 stage 名稱，可在另一個 terminal 用 `tail -f <輸出目錄>/progress.jsonl` 查看。DNS 與 Web 檢查可同時進行。每個 origin 的 vhost、path、extension 掃描預設依序執行；加入 `--scanner-workers 2` 或 `3` 可同時跑最多 2 或 3 個 `ffuf` 階段。`--ffuf-rate 10` 將每個 `ffuf` 程序限制為最多 10 requests/s；預設為 20。若有 2 個 worker，合計上限可達 20 requests/s。這個參數控制 vhost、path、extension 字典掃描，不控制 `gobuster dns` 或固定 Web 檢查。續跑會沿用前次 rate；指定新 rate 只影響新掃描或重試的階段，已完成的階段繼續沿用原始證據。ffuf 每個工作的 timeout 至少為 1 小時；大型字典會依項數與 rate 延長，實際值記在對應的 `*.status.json`。`--hosts-file` 的 hostname 仍逐一處理。
 
+`HTTP extension scan (known filename: index.*)` 表示用已知檔名 `index` 測 extension 字典，例如 `/index.php`。確認 extension 後，`HTTP extension scan (filename guesses: *.php)` 表示用 path 字典猜 `.php` 檔名，例如 `/admin.php`；進度分母是該階段的字典項數。
+
 `--public-sources` 才查 crt.sh 與 Wayback CDX；候選 hostname 不會在同一輪自動探測。`.htb` 等內部名稱不送到公共資料來源。當前服務的 TLS certificate SAN 始終檢查。來源、上限與輸出見 [公開資料來源](docs/public-sources.md)。
 
 ## 固定檢查

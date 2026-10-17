@@ -144,6 +144,67 @@ class FuzzTests(unittest.TestCase):
         self.assertEqual(controls.call_count, 1)
         self.assertEqual(controls.call_args.kwargs["path_suffix"], ".php")
 
+    def test_extension_progress_names_stem_and_confirmed_extension_without_renaming_artifacts(self):
+        extensions = self.wordlist("extensions.txt", "php\n")
+        paths = self.wordlist("paths.txt", "admin\n")
+        seen = []
+
+        def scan(args, name, stdout, stderr, progress, timeout):
+            seen.append(name)
+            progress(name, 1, 1)
+            hits = ([hit(".php", "http://box.htb/index.php", length=400)]
+                    if name == "extension-stem-1" else [])
+            Path(args[args.index("-o") + 1]).write_text(json.dumps({"results": hits}))
+            stdout.write_bytes(b"")
+            stderr.write_bytes(b"")
+            return 0, False
+
+        updates = []
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), \
+             patch.object(fuzz, "_save_controls", return_value=([BASELINE, BASELINE], [], [])), \
+             patch.object(fuzz, "_run_with_progress", side_effect=scan):
+            result = fuzz.run_extensions("http://box.htb", paths, extensions, ["login"],
+                                         self.root / "out", 1, progress=lambda *args: updates.append(args))
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(seen, ["extension-stem-1", "extension-stem-2", "extension-filenames-1"])
+        self.assertEqual(updates, [("extension-stem-1:index", 1, 1),
+                                   ("extension-stem-2:login", 1, 1),
+                                   ("extension-filenames-1:.php", 1, 1)])
+        for name in seen:
+            self.assertTrue((self.root / "out" / f"{name}.status.json").is_file())
+            self.assertTrue((self.root / "out" / f"{name}.json").is_file())
+        self.assertEqual(json.loads((self.root / "out" / "extension-stem-1.status.json").read_text())
+                         ["returncode"], 0)
+
+    def test_filename_only_rerun_progress_names_each_confirmed_extension(self):
+        paths = self.wordlist("paths.txt", "admin\n")
+        seen = []
+
+        def scan(args, name, stdout, stderr, progress, timeout):
+            seen.append(name)
+            progress(name, 1, 1)
+            Path(args[args.index("-o") + 1]).write_text('{"results": []}')
+            stdout.write_bytes(b"")
+            stderr.write_bytes(b"")
+            return 0, False
+
+        updates = []
+        with patch.object(fuzz.shutil, "which", return_value="/usr/bin/ffuf"), \
+             patch.object(fuzz, "_save_controls", return_value=([BASELINE, BASELINE], [], [])), \
+             patch.object(fuzz, "_run_with_progress", side_effect=scan):
+            result = fuzz.run_extension_filenames(
+                "http://box.htb", paths, [".txt", ".php"], self.root / "out", 2,
+                progress=lambda *args: updates.append(args))
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(seen, ["extension-filenames-1", "extension-filenames-2"])
+        self.assertEqual(updates, [("extension-filenames-1:.php", 1, 1),
+                                   ("extension-filenames-2:.txt", 1, 1)])
+        for name in seen:
+            self.assertTrue((self.root / "out" / f"{name}.status.json").is_file())
+            self.assertTrue((self.root / "out" / f"{name}.json").is_file())
+
     def test_extension_uses_rendered_url_when_ffuf_input_is_calibration_word(self):
         extensions = self.wordlist("extensions.txt", "php\n")
         paths = self.wordlist("paths.txt", "admin\n")

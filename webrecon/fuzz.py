@@ -36,6 +36,18 @@ def _scan_timeout(wordlist: Path, rate: int | None = None) -> float:
     return max(TIMEOUT, math.ceil(entries / (RATE if rate is None else rate) * 1.5))
 
 
+def _progress_with_target(
+    progress: Callable[[str, int, int], None] | None, target: str
+) -> Callable[[str, int, int], None] | None:
+    if progress is None:
+        return None
+
+    def report(scan: str, current: int, total: int) -> None:
+        progress(f"{scan}:{target}", current, total)
+
+    return report
+
+
 def _report(status: str, **more: object) -> dict:
     return {"status": status, "candidates": [], "uncertain_hits": [], "artifacts": [], "diagnostics": [], **more}
 
@@ -543,7 +555,7 @@ def run_extensions(
     for index, stem in enumerate(stems, 1):
         hits, new_artifacts, new_diagnostics, scan_status = _scan(
             out_dir, f"extension-stem-{index}", normalized, f"{origin}/{stem}FUZZ",
-            progress=progress, **rate_arg,
+            progress=_progress_with_target(progress, stem), **rate_arg,
         )
         artifacts.extend(new_artifacts)
         diagnostics.extend(new_diagnostics)
@@ -601,7 +613,7 @@ def run_extensions(
                 request_count += count
                 hits, new_artifacts, new_diagnostics, scan_status = _scan(
                     out_dir, f"extension-filenames-{index}", limited, f"{origin}/FUZZ{extension}",
-                    progress=progress, **rate_arg,
+                    progress=_progress_with_target(progress, extension), **rate_arg,
                 )
                 artifacts.extend(new_artifacts)
                 diagnostics.extend(new_diagnostics)
@@ -697,7 +709,7 @@ def run_extension_filenames(
             status = "error"
         hits, new_artifacts, new_diagnostics, scan_status = _scan(
             out_dir, f"extension-filenames-{index}", limited, f"{origin}/FUZZ{extension}",
-            progress=progress, **rate_arg,
+            progress=_progress_with_target(progress, extension), **rate_arg,
         )
         artifacts.extend(new_artifacts)
         diagnostics.extend(new_diagnostics)
