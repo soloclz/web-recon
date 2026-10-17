@@ -143,8 +143,9 @@ python3 ~/tools/web-recon/scripts/web-recon.py \
   --hosts-file hosts.txt
 ```
 
-`--extend-run` inherits the source port, wordlists, and scan limits unless you override them. A supplied `--port` must match the source. The source must be a completed run with a schema version 2 `report.json`.
-Runs created before schema version 2 cannot be used as a continuation source. Use `--fresh` to start a new history with this version.
+`--extend-run` selects one completed schema version 2 run when the engagement directory has multiple histories for the same port. It inherits that run's port, wordlists, and scan limits unless you override them. A supplied `--port` must match the source.
+
+Runs created before schema version 2 cannot be reused. If the saved pointer refers to one, the tool ignores it and starts a new run when no version 2 run is available. Supply any wordlists you want in that new run. Use `--fresh` when you want a new history despite an available version 2 run.
 
 To scan everything again, including pages that may have changed on the server, start a new history and supply the wordlists again:
 

@@ -518,6 +518,8 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 if args.extend_run is None and not args.fresh:
                     args.extend_run = state.select_source()
+                    if state.ignored_legacy_run is not None:
+                        print(f"Ignoring older run format: {state.ignored_legacy_run}", flush=True)
                     if args.extend_run is not None:
                         print(f"Continuing: {args.extend_run}", flush=True)
                 if args.extend_run is not None:

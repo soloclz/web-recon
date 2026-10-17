@@ -29,6 +29,7 @@ class RunState:
         self.port = port
         self.directory = self.scope / ".web-recon"
         self.pointer = self.directory / f"port-{port}.json"
+        self.ignored_legacy_run: Path | None = None
 
     def _metadata(self, path: Path) -> dict | None:
         if not path.is_dir() or not (path / "report.json").is_file():
@@ -82,15 +83,22 @@ class RunState:
         except (OSError, ValueError, KeyError, TypeError) as exc:
             raise ValueError(
                 f"saved run state is invalid: {self.pointer}; "
-                "use --extend-run SOURCE or --fresh") from exc
+                "use --fresh or --extend-run with a completed schema-v2 run") from exc
 
     def select_source(self) -> Path | None:
         runs = self._runs()
         pointer = self._pointer_run()
         if pointer is not None and pointer not in runs:
-            raise ValueError(
-                f"saved run is unavailable: {pointer}; "
-                "use --extend-run SOURCE or --fresh")
+            # Pre-v2 completed runs have run.json but no canonical report.json.
+            # They cannot be reused; a current run with missing evidence still errors.
+            if (pointer.is_dir() and (pointer / "run.json").is_file()
+                    and not (pointer / "report.json").exists()):
+                self.ignored_legacy_run = pointer
+                pointer = None
+            else:
+                raise ValueError(
+                    f"saved run is unavailable: {pointer}; "
+                    "use --fresh or --extend-run with a completed schema-v2 run")
         if pointer is None and not runs:
             return None
 

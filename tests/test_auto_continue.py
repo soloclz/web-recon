@@ -87,6 +87,17 @@ class AutoContinueTests(unittest.TestCase):
                                "extensions_wordlist": None},
                               settings=cli.scan_settings(options))
 
+    def _legacy_pointer(self, directory: Path, port: int = 8080) -> Path:
+        directory.mkdir()
+        (directory / "run.json").write_text("{}\n", encoding="utf-8")
+        (directory / "report.md").write_text("# Older report\n", encoding="utf-8")
+        state_dir = self.scope / ".web-recon"
+        state_dir.mkdir(exist_ok=True)
+        pointer = state_dir / f"port-{port}.json"
+        pointer.write_text(json.dumps({"schema": 1, "port": port,
+                                       "run": str(directory.resolve())}), encoding="utf-8")
+        return pointer
+
     def test_ordinary_second_invocation_extends_unique_run_in_output_parent(self):
         first = self.scope / "first"
         second = self.scope / "second"
@@ -182,9 +193,44 @@ class AutoContinueTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):
             self._invoke("--host", self.new, "--port", "8080",
                          "--out-dir", str(second))
-        self.assertIn("--extend-run", errors.getvalue())
+        self.assertIn("saved run is unavailable", errors.getvalue())
         self.assertEqual(self.scanned, [(self.old, 8080)])
         self.assertFalse(second.exists())
+
+    def test_legacy_pointer_without_version_two_run_starts_new_history(self):
+        legacy = self.scope / "old-format"
+        pointer = self._legacy_pointer(legacy)
+        output = self.scope / "new-format"
+
+        self.assertEqual(self._invoke("--host", self.new, "--port", "8080",
+                                      "--out-dir", str(output)), 0)
+
+        self.assertEqual(self.scanned, [(self.new, 8080)])
+        self.assertEqual(self._actions(output), {self.new: "scanned"})
+        self.assertEqual(json.loads(pointer.read_text(encoding="utf-8"))["run"],
+                         str(output.resolve()))
+        self.assertTrue((legacy / "run.json").is_file())
+        self.assertFalse((legacy / "report.json").exists())
+
+    def test_legacy_pointer_adopts_unique_version_two_run(self):
+        legacy = self.scope / "old-format"
+        pointer = self._legacy_pointer(legacy)
+        current = self.scope / "current-format"
+        self._completed_run(current, self.old)
+        self.scanned.clear()
+        hosts = self.root / "hosts.txt"
+        hosts.write_text(f"{self.old}\n{self.new}\n", encoding="utf-8")
+        output = self.scope / "next"
+
+        self.assertEqual(self._invoke("--hosts-file", str(hosts), "--port", "8080",
+                                      "--out-dir", str(output)), 0)
+
+        self.assertEqual(self.scanned, [(self.new, 8080)])
+        self.assertEqual(self._actions(output), {self.old: "reused", self.new: "scanned"})
+        self.assertEqual(load_report(output)["run"]["extended_from"],
+                         str(current.resolve()))
+        self.assertEqual(json.loads(pointer.read_text(encoding="utf-8"))["run"],
+                         str(output.resolve()))
 
     def test_failed_attempt_does_not_replace_current_run(self):
         first, failed, third = (self.scope / name for name in
