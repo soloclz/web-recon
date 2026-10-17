@@ -117,6 +117,12 @@ def _candidate_callback(reporter: ProgressReporter | None, host: str, stage: str
         elif kind == "comment":
             status = "observed"
             detail = f"{item.get('url', '')} comment={item.get('text', '')[:300]}"
+        elif kind == "inventory":
+            status = "observed"
+            source = "crawl"
+            detail = f"{item.get('category', 'item')}={item.get('value', '')}"
+            if item.get("source_url"):
+                detail += f" (from {item['source_url']})"
         elif kind == "hostname":
             detail = item.get("name", "")
             if item.get("wildcard_match"):
@@ -212,7 +218,7 @@ def run_host(host: str, port: int, run_dir: Path, options: argparse.Namespace,
     slug = hashlib.sha256(host.encode("utf-8")).hexdigest()[:10]
     host_dir = run_dir / "hosts" / f"{host[:80]}-{slug}"
     host_dir.mkdir(parents=True, exist_ok=False)
-    result: dict = {"host": host, "port": port, "status": "error", "resolved_ips": [],
+    result: dict = {"host": host, "port": port, "status": "error", "action": "scanned", "resolved_ips": [],
                     "scan_settings": scan_settings(options),
                     "stages": {}, "web": {}, "scanners": {}, "new_hosts": []}
     if progress is not None:
@@ -352,39 +358,31 @@ def write_run_outputs(run_dir: Path, results: list[dict], port: int,
                       source_run: Path | None = None,
                       extended_from: Path | None = None,
                       rerun_stages: tuple[str, ...] = ()) -> None:
-    """Write the batch overview and both reports after every host finishes."""
-    from .report import write_json_report, write_report
+    """Write the batch overview and canonical report after every host finishes."""
+    from .report import write_json_report
 
-    new_hosts: dict[str, dict] = {}
-    processed_hosts = {result["host"] for result in results}
-    for result in results:
-        for entry in result.get("new_hosts", []):
-            if entry["name"] in processed_hosts:
-                continue
-            item = new_hosts.setdefault(entry["name"], {"name": entry["name"], "observations": []})
-            item["observations"].append({"input_host": result["host"], "sources": entry["sources"],
-                                         "source_ip_port": entry["source_ip_port"]})
-    (run_dir / "new-hosts.txt").write_text("".join(name + "\n" for name in sorted(new_hosts)), encoding="utf-8")
-    (run_dir / "new-hosts.jsonl").write_text("".join(json.dumps(new_hosts[name], ensure_ascii=False) + "\n"
-                                                  for name in sorted(new_hosts)), encoding="utf-8")
     overview = {"created_at": datetime.now().isoformat(), "port": port, "wordlists": wordlists,
-                "wordlist_hashes": wordlist_hashes if wordlist_hashes is not None else hash_wordlists(wordlists),
-                "hosts": [{"host": item["host"], "status": item["status"],
-                           "action": item.get("action", "scanned"),
-                           "resolved_ips": item["resolved_ips"],
-                           "new_host_count": len(item.get("new_hosts", []))} for item in results]}
+                "wordlist_hashes": wordlist_hashes if wordlist_hashes is not None else hash_wordlists(wordlists)}
     if settings is not None:
         overview["scan_settings"] = settings
     if source_run is not None:
         overview["source_run"] = str(source_run)
         overview["rerun_stages"] = list(rerun_stages)
-        if len(rerun_stages) == 1:
-            overview["only"] = rerun_stages[0]
     if extended_from is not None:
         overview["extended_from"] = str(extended_from)
-    write_report(run_dir, results)
     write_json_report(run_dir, results, overview)
-    (run_dir / "run.json").write_text(json.dumps(overview, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def print_run_summary(run_dir: Path) -> None:
+    """Render the saved JSON once, for fresh and continued runs alike."""
+    from .report import load_json_report
+    from .result_view import render_terminal
+
+    run_dir = run_dir.resolve()
+    report_path = run_dir / "report.json"
+    report_data = load_json_report(run_dir)
+    print(render_terminal(report_data), flush=True)
+    print(f"Report: {report_path}", flush=True)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -398,10 +396,12 @@ def parser() -> argparse.ArgumentParser:
                               help="reuse a completed run and rerun stages selected by wordlist flags")
     source_group.add_argument("--extend-run", type=Path,
                               help="add hostnames to a completed run without rescanning finished hosts")
+    source_group.add_argument("--report", type=Path,
+                              help="show a completed run in the terminal without making requests or changes")
     ap.add_argument("--fresh", action="store_true",
                     help="start a new run history in this engagement directory")
     ap.add_argument("--only", choices=("prefixes", "paths", "extensions"),
-                    help="optional explicit single stage for legacy reruns")
+                    help="rerun one wordlist stage from a completed run")
     ap.add_argument("--host-prefixes-wordlist", type=Path)
     ap.add_argument("--paths-wordlist", type=Path)
     ap.add_argument("--extensions-wordlist", type=Path)
@@ -434,8 +434,7 @@ def _fresh_main(args: argparse.Namespace) -> int:
             results.append(run_host(host, args.port, run_dir, args, progress))
     write_run_outputs(run_dir, results, args.port, wordlists, wordlist_hashes=wordlist_hashes,
                       settings=scan_settings(args))
-    print(f"Report: {run_dir / 'report.md'}", flush=True)
-    print(f"JSON: {run_dir / 'report.json'}", flush=True)
+    print_run_summary(run_dir)
     print(run_dir)
     return 0 if all(item["status"] == "completed" for item in results) else 1
 
@@ -444,6 +443,17 @@ def main(argv: list[str] | None = None) -> int:
     ap = parser()
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = ap.parse_args(raw_argv)
+    if args.report is not None:
+        flags = [token for token in raw_argv if token.startswith("-")]
+        if len(flags) != 1 or not (flags[0] == "--report" or flags[0].startswith("--report=")):
+            ap.error("--report accepts only a completed run directory")
+        from .report import load_json_report
+        try:
+            load_json_report(args.report)
+        except ValueError as exc:
+            ap.error(str(exc))
+        print_run_summary(args.report)
+        return 0
     args.explicit_limits = {name for name in (*WEB_LIMIT_NAMES, "max_extra_requests")
                             if any(arg == "--" + name.replace("_", "-") or
                                    arg.startswith("--" + name.replace("_", "-") + "=")

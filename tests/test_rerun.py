@@ -11,6 +11,7 @@ from urllib.parse import unquote
 from unittest.mock import patch
 
 from webrecon import cli, fuzz, rerun
+from fixture_report import save_fixture_report
 
 
 class RerunTests(unittest.TestCase):
@@ -62,9 +63,9 @@ class RerunTests(unittest.TestCase):
             "new_hosts": [],
         }
         (self.host_dir / "summary.json").write_text(json.dumps(self.result))
-        (self.source / "run.json").write_text(json.dumps({
+        save_fixture_report(self.source, {
             "port": 8080, "hosts": [{"host": self.host}],
-            "wordlists": {"paths_wordlist": str(self.old_paths)}}))
+            "wordlists": {"paths_wordlist": str(self.old_paths)}})
 
     def _wordlist(self, name: str) -> Path:
         path = self.root / name
@@ -100,14 +101,9 @@ class RerunTests(unittest.TestCase):
         prefix = summary["web"]["http"]["pages"][0]["prefix"]
         self.assertFalse(Path(prefix).is_absolute())
         self.assertEqual((output / f"{prefix}.body").read_text(), "<form action='/login'></form>")
-        report = (output / "report.md").read_text()
-        self.assertIn("new.box.example.test", report)
-        self.assertIn("Referenced reused evidence is included in this run", report)
-        self.assertIn("[summary.json](hosts/", report)
-        for href in re.findall(r"\]\(([^)]+)\)", report):
-            target = (output / unquote(href)).resolve()
-            self.assertTrue(target.is_relative_to(output.resolve()), href)
-            self.assertTrue(target.is_file(), href)
+        report = json.loads((output / "report.json").read_text())
+        self.assertIn("new.box.example.test", [item["name"] for item in report["new_hosts"]])
+        self.assertEqual(report["hosts"][0]["web"]["http"]["pages"][0]["prefix"], prefix)
         self.assertFalse((rerun._host_dir(output, self.host) / "responses").exists())
         self.assertTrue((rerun._host_dir(output, self.host) / "reused").is_dir())
 
@@ -150,7 +146,7 @@ class RerunTests(unittest.TestCase):
         self.assertEqual(summary["scanners"]["http"]["paths"], self.result["scanners"]["http"]["paths"])
 
     def test_incomplete_source_rejected_before_creating_output(self):
-        (self.source / "run.json").unlink()
+        (self.source / "report.json").unlink()
         output = self.root / "unused"
         with self.assertRaises(SystemExit):
             cli.main(["--from-run", str(self.source), "--only", "paths",

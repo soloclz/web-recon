@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from webrecon import cli, rerun
+from fixture_report import load_report
 
 
 @contextmanager
@@ -74,10 +75,9 @@ class AutoContinueTests(unittest.TestCase):
             return cli.main(list(arguments))
 
     def _actions(self, run_dir: Path) -> dict[str, str]:
-        overview = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
-        return {item["host"]: item["action"] for item in overview["hosts"]}
+        return {item["host"]: item["action"] for item in load_report(run_dir)["hosts"]}
 
-    def _legacy_run(self, directory: Path, host: str, port: int = 8080) -> None:
+    def _completed_run(self, directory: Path, host: str, port: int = 8080) -> None:
         directory.mkdir()
         options = cli.parser().parse_args(["--host", host, "--port", str(port)])
         result = self._scan(host, port, directory, options, None)
@@ -94,13 +94,14 @@ class AutoContinueTests(unittest.TestCase):
         hosts.write_text(f"{self.old}\n{self.new}\n", encoding="utf-8")
         self.assertEqual(self._invoke("--host", self.old, "--port", "8080",
                                       "--out-dir", str(first)), 0)
-        self.assertIsNone(json.loads((first / "run.json").read_text())[
-            "scan_settings"]["ffuf_rate"])
+        self.assertIsNone(load_report(first)["run"]["scan_settings"]["ffuf_rate"])
+        for redundant in ("run.json", "report.md", "new-hosts.txt", "new-hosts.jsonl"):
+            self.assertFalse((first / redundant).exists(), redundant)
         self.assertEqual(self._invoke("--hosts-file", str(hosts), "--port", "8080",
                                       "--out-dir", str(second)), 0)
         self.assertEqual(self.scanned, [(self.old, 8080), (self.new, 8080)])
         self.assertEqual(self._actions(second), {self.old: "reused", self.new: "scanned"})
-        self.assertEqual(json.loads((second / "run.json").read_text())["extended_from"],
+        self.assertEqual(load_report(second)["run"]["extended_from"],
                          str(first.resolve()))
 
     def test_no_out_dir_uses_current_directory_as_scope(self):
@@ -108,7 +109,7 @@ class AutoContinueTests(unittest.TestCase):
             self.assertEqual(self._invoke("--host", self.old, "--port", "8080"), 0)
             self.assertEqual(self._invoke("--host", self.old, "--port", "8080"), 0)
         runs = sorted(path for path in self.scope.glob("web-recon-*")
-                      if (path / "run.json").is_file())
+                      if (path / "report.json").is_file())
         self.assertEqual(len(runs), 2)
         self.assertEqual(self.scanned, [(self.old, 8080)])
         self.assertEqual(self._actions(runs[-1]), {self.old: "reused"})
@@ -197,16 +198,16 @@ class AutoContinueTests(unittest.TestCase):
              self.assertRaises(SystemExit):
             cli.main(["--host", self.new, "--port", "8080",
                       "--out-dir", str(failed)])
-        self.assertFalse((failed / "run.json").exists())
+        self.assertFalse((failed / "report.json").exists())
         self.assertEqual(pointer.read_bytes(), before)
         self.assertEqual(self._invoke("--host", self.old, "--port", "8080",
                                       "--out-dir", str(third)), 0)
         self.assertEqual(self.scanned, [(self.old, 8080)])
         self.assertEqual(self._actions(third), {self.old: "reused"})
 
-    def test_unique_legacy_run_can_be_adopted_without_a_pointer(self):
+    def test_unique_completed_run_can_be_adopted_without_a_pointer(self):
         previous = self.scope / "web-recon-20260101-000000"
-        self._legacy_run(previous, self.old)
+        self._completed_run(previous, self.old)
         self.scanned.clear()
         output = self.scope / "next"
         self.assertEqual(self._invoke("--host", self.new, "--port", "8080",
@@ -214,11 +215,11 @@ class AutoContinueTests(unittest.TestCase):
         self.assertEqual(self.scanned, [(self.new, 8080)])
         self.assertEqual(self._actions(output), {self.old: "reused", self.new: "scanned"})
 
-    def test_ambiguous_legacy_histories_require_explicit_source(self):
+    def test_ambiguous_completed_histories_require_explicit_source(self):
         left = self.scope / "web-recon-20260101-000000"
         right = self.scope / "web-recon-20260102-000000"
-        self._legacy_run(left, self.old)
-        self._legacy_run(right, self.new)
+        self._completed_run(left, self.old)
+        self._completed_run(right, self.new)
         self.scanned.clear()
         output = self.scope / "next"
         with redirect_stderr(io.StringIO()) as errors, self.assertRaises(SystemExit):

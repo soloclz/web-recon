@@ -9,15 +9,16 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
+from .report import load_json_report
 from .rerun import _host_dir
 
 
 def source_port(source: Path) -> int:
     try:
-        port = json.loads((source / "run.json").read_text(encoding="utf-8"))["port"]
-    except (OSError, ValueError, KeyError, TypeError) as exc:
+        port = load_json_report(source)["run"]["port"]
+    except (ValueError, KeyError, TypeError) as exc:
         raise ValueError(f"source run has no readable port: {source}") from exc
-    if not isinstance(port, int) or not 1 <= port <= 65535:
+    if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError(f"source run has no valid port: {source}")
     return port
 
@@ -30,11 +31,12 @@ class RunState:
         self.pointer = self.directory / f"port-{port}.json"
 
     def _metadata(self, path: Path) -> dict | None:
-        if not path.is_dir() or not (path / "report.md").is_file():
+        if not path.is_dir() or not (path / "report.json").is_file():
             return None
         try:
-            metadata = json.loads((path / "run.json").read_text(encoding="utf-8"))
-            hosts = metadata["hosts"]
+            report = load_json_report(path)
+            metadata = report["run"]
+            hosts = report["hosts"]
             if (metadata["port"] != self.port or not isinstance(hosts, list)
                     or not hosts):
                 return None

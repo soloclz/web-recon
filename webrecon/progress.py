@@ -138,7 +138,8 @@ class ProgressReporter:
     @staticmethod
     def _candidate_key(host: str, stage: str, status: str, item: dict,
                        display: str) -> tuple:
-        identity_fields = ("name", "url", "hostname", "path", "value", "record",
+        identity_fields = ("name", "url", "hostname", "path", "value", "category",
+                           "source_url", "record",
                            "address", "ip", "target", "answer", "extension", "title",
                            "host", "candidate", "method", "tag", "type", "text")
         fields = {key: item[key] for key in ("kind", "source", *identity_fields)

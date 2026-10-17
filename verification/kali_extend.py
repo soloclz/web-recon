@@ -46,7 +46,7 @@ try:
     main(["--hosts-file", str(hosts), "--port", str(server.server_port),
           "--out-dir", str(second)])
     actions = {item["host"]: item["action"] for item in json.loads(
-        (second / "run.json").read_text())["hosts"]}
+        (second / "report.json").read_text())["hosts"]}
     assert actions == {"127.0.0.1": "reused", "127.0.0.2": "scanned"}, actions
 
     paths.write_text("two\n")
@@ -54,14 +54,14 @@ try:
     main(["--hosts-file", str(hosts), "--port", str(server.server_port),
           "--out-dir", str(third)])
     actions = {item["host"]: item["action"] for item in json.loads(
-        (third / "run.json").read_text())["hosts"]}
+        (third / "report.json").read_text())["hosts"]}
     assert actions == {"127.0.0.1": "updated", "127.0.0.2": "updated"}, actions
     for summary_path in third.glob("hosts/*/summary.json"):
         summary = json.loads(summary_path.read_text())
         assert summary["rerun"]["stages"] == ["paths"], summary_path
         assert summary["scanners"]["http"]["paths"]["status"] == "completed", summary_path
         assert not (summary_path.parent / "responses").exists(), summary_path
-    assert (third / "report.md").is_file()
+    assert (third / "report.json").is_file()
     print(json.dumps({"directory": str(root), "second_actions": {
         "127.0.0.1": "reused", "127.0.0.2": "scanned"}, "third_actions": actions}, indent=2))
 finally:

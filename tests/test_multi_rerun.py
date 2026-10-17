@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from webrecon import cli, rerun
+from fixture_report import fixture_overview, load_report, save_fixture_report
 
 
 class MultiRerunTests(unittest.TestCase):
@@ -80,13 +81,11 @@ class MultiRerunTests(unittest.TestCase):
             "new_hosts": [],
         }
         (self.host_dir / "summary.json").write_text(json.dumps(self.source_result))
-        (self.source / "run.json").write_text(
-            json.dumps({
+        save_fixture_report(self.source, {
                 "port": self.port,
                 "hosts": [{"host": self.host}],
                 "wordlists": {"paths_wordlist": str(self.old_paths)},
             })
-        )
 
     def _wordlist(self, name):
         path = self.root / name
@@ -179,12 +178,11 @@ class MultiRerunTests(unittest.TestCase):
 
     def test_rerun_keeps_hash_of_unchanged_stage(self):
         prefixes = self._wordlist("old-prefixes.txt")
-        source_index = self.source / "run.json"
-        overview = json.loads(source_index.read_text())
+        overview = fixture_overview(self.source)
         overview["wordlists"]["host_prefixes_wordlist"] = str(prefixes)
         overview["wordlist_hashes"] = cli.hash_wordlists(overview["wordlists"])
         old_hash = overview["wordlist_hashes"]["host_prefixes_wordlist"]
-        source_index.write_text(json.dumps(overview))
+        save_fixture_report(self.source, overview)
         prefixes.write_text("changed without a prefix rerun\n")
         paths = self._wordlist("replacement-paths.txt")
 
@@ -193,7 +191,7 @@ class MultiRerunTests(unittest.TestCase):
             code, output, _ = self._run("hash-preservation", "--paths-wordlist", str(paths))
 
         self.assertEqual(code, 0)
-        saved = json.loads((output / "run.json").read_text())
+        saved = load_report(output)["run"]
         self.assertEqual(saved["wordlist_hashes"]["host_prefixes_wordlist"], old_hash)
         self.assertNotEqual(old_hash, cli.hash_wordlists({"prefix": str(prefixes)})["prefix"])
 
@@ -238,13 +236,14 @@ class MultiRerunTests(unittest.TestCase):
             summary["scanners"]["http"]["extensions"]["candidates"],
             self._extension_result()["candidates"],
         )
-        overview = json.loads((output / "run.json").read_text())
+        overview = load_report(output)["run"]
         self.assertEqual(overview["source_run"], str(self.source.resolve()))
         self.assertEqual(overview["rerun_stages"], ["paths", "extensions"])
         self.assertNotIn("only", overview)
         self.assertEqual(overview["wordlists"]["paths_wordlist"], str(paths.resolve()))
         self.assertEqual(overview["wordlists"]["extensions_wordlist"], str(extensions.resolve()))
-        self.assertIn("Rerun stages: **paths, extensions**", (output / "report.md").read_text())
+        self.assertEqual(json.loads((output / "report.json").read_text())["run"]["rerun_stages"],
+                         ["paths", "extensions"])
 
     def test_three_flags_run_each_stage_once(self):
         prefixes = self._wordlist("prefixes.txt")
@@ -305,7 +304,7 @@ class MultiRerunTests(unittest.TestCase):
             first_summary["scanners"]["http"]["paths"],
             self.source_result["scanners"]["http"]["paths"],
         )
-        first_metadata = json.loads((first_run / "run.json").read_text())
+        first_metadata = load_report(first_run)["run"]
         self.assertEqual(first_metadata["wordlists"]["paths_wordlist"], str(self.old_paths))
         self.assertEqual(
             first_metadata["wordlists"]["extension_names_wordlist"],
@@ -377,7 +376,7 @@ class MultiRerunTests(unittest.TestCase):
             code, updated, _ = self._run(
                 "legacy-rate", "--paths-wordlist", str(paths), "--ffuf-rate", "7")
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads((updated / "run.json").read_text())[
+        self.assertEqual(load_report(updated)["run"][
             "scan_settings"]["ffuf_rate"], 7)
 
         next_run = self.root / "auto-after-legacy-rate"
@@ -385,9 +384,10 @@ class MultiRerunTests(unittest.TestCase):
             self.assertEqual(cli.main([
                 "--host", self.host, "--port", str(self.port),
                 "--out-dir", str(next_run)]), 0)
-        metadata = json.loads((next_run / "run.json").read_text())
+        data = load_report(next_run)
+        metadata = data["run"]
         self.assertIsNone(metadata["scan_settings"]["ffuf_rate"])
-        self.assertEqual(metadata["hosts"][0]["action"], "reused")
+        self.assertEqual(data["hosts"][0]["action"], "reused")
 
     def test_matching_host_and_port_are_accepted_as_redundant(self):
         paths = self._wordlist("paths.txt")

@@ -14,6 +14,7 @@ from unittest.mock import patch
 from urllib.parse import unquote
 
 from webrecon import cli, report, rerun
+from fixture_report import refresh_fixture_hosts, save_fixture_report
 
 
 EVIDENCE_KEYS = {"prefix", "artifact", "stdout", "stderr", "meta"}
@@ -77,10 +78,10 @@ class PortableRerunTests(unittest.TestCase):
             "public_sources": {"status": "not_run"}, "new_hosts": [],
         }
         (self.host_dir / "summary.json").write_text(json.dumps(result))
-        (self.source / "run.json").write_text(json.dumps({
+        save_fixture_report(self.source, {
             "port": self.port, "hosts": [{"host": self.host}],
             "wordlists": {"paths_wordlist": str(self.path_words)},
-        }))
+        })
 
     @staticmethod
     def _artifact(path: Path, contents: str) -> Path:
@@ -119,14 +120,9 @@ class PortableRerunTests(unittest.TestCase):
         return {"status": "completed", "artifacts": [str(artifact)], "candidates": []}
 
     def _assert_package(self, package: Path):
-        report = (package / "report.md").read_text()
-        self.assertIn("[summary.json]", report)
-        self.assertIn("[body]", report)
-        self.assertIn("[raw]", report)
-        for href in re.findall(r"\]\(([^)]+)\)", report):
-            target = (package / unquote(href)).resolve()
-            self.assertTrue(target.is_relative_to(package.resolve()), href)
-            self.assertTrue(target.is_file(), href)
+        report = json.loads((package / "report.json").read_text())
+        self.assertEqual(report["schema_version"], 2)
+        self.assertEqual(report["hosts"][0]["host"], self.host)
         summary = json.loads((rerun._host_dir(package, self.host) / "summary.json").read_text())
 
         def inspect(value, key=""):
@@ -148,6 +144,7 @@ class PortableRerunTests(unittest.TestCase):
                     self.assertTrue(target.is_file(), value)
 
         inspect(summary)
+        inspect(report["hosts"][0])
         return summary
 
     def test_rerun_survives_source_removal_and_relocation(self):
@@ -175,7 +172,9 @@ class PortableRerunTests(unittest.TestCase):
         self.assertEqual(old_extension.read_text(), "old extension")
         self.assertFalse(any(path.read_text() == "old path"
                              for path in relocated.rglob("old.json")))
-        report.report_existing_run(relocated)
+        before = (relocated / "report.json").read_bytes()
+        self.assertEqual(report.load_json_report(relocated)["hosts"][0]["host"], self.host)
+        self.assertEqual((relocated / "report.json").read_bytes(), before)
         self._assert_package(relocated)
 
     def test_missing_source_evidence_fails_before_scanner_starts(self):
@@ -193,6 +192,7 @@ class PortableRerunTests(unittest.TestCase):
         summary = json.loads(summary_path.read_text())
         summary["tls"]["artifacts"] = [str(outside)]
         summary_path.write_text(json.dumps(summary))
+        refresh_fixture_hosts(self.source)
         with patch.object(rerun, "run_paths") as scanner, redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 cli.main(["--from-run", str(self.source),
@@ -226,7 +226,7 @@ class PortableRerunTests(unittest.TestCase):
         self.assertEqual((relocated / scanner["vhost"]["artifacts"][0]).read_text(), "new vhost")
         self.assertEqual((relocated / scanner["paths"]["artifacts"][0]).read_text(), "new path")
         self.assertEqual((relocated / scanner["extensions"]["artifacts"][0]).read_text(), "old extension")
-        report.report_existing_run(relocated)
+        self.assertEqual(report.load_json_report(relocated)["hosts"][0]["host"], self.host)
         self._assert_package(relocated)
 
 

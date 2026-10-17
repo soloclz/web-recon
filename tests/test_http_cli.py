@@ -11,6 +11,7 @@ from unittest.mock import patch
 from urllib.parse import urlsplit
 
 from webrecon import cli, http
+from webrecon.extract import empty_inventory
 
 
 def make_response(url, status=200, body=b"", content_type="text/html", exit_code=0):
@@ -245,32 +246,37 @@ class HttpCliTests(unittest.TestCase):
              patch.object(cli, "probe_origins", side_effect=probe), \
              patch.object(cli, "get_tls_certificate", return_value={"status": "completed", "san": []}), \
              patch.object(cli, "run_dns", return_value={"status": "completed", "candidates": []}), \
-             patch.object(cli, "inspect_origin", return_value={"status": "completed", "pages": []}), \
+             patch.object(cli, "inspect_origin", return_value={"status": "completed", "pages": [],
+                                                                  "inventory": empty_inventory()}), \
              patch.object(cli, "run_vhost", return_value={"status": "not_run"}), \
              patch.object(cli, "run_paths", return_value={"status": "not_run"}), \
              patch.object(cli, "run_extensions", return_value={"status": "not_run"}):
             exit_code = cli.main(["--hosts-file", str(hosts_file), "--port", "8080",
                                   "--out-dir", str(out_dir)])
 
-        overview = json.loads((out_dir / "run.json").read_text(encoding="utf-8"))
+        report_data = json.loads((out_dir / "report.json").read_text(encoding="utf-8"))
         self.assertEqual(exit_code, 1)
-        self.assertEqual([(item["host"], item["status"]) for item in overview["hosts"]],
+        self.assertEqual([(item["host"], item["status"]) for item in report_data["hosts"]],
                          [("missing.htb", "error"), ("good.htb", "completed")])
         summaries = sorted((out_dir / "hosts").glob("*/summary.json"))
         self.assertEqual(len(summaries), 2)
-        report_data = json.loads((out_dir / "report.json").read_text(encoding="utf-8"))
-        self.assertEqual(report_data["run"], overview)
+        self.assertEqual(report_data["schema_version"], 2)
+        self.assertEqual(report_data["run"]["port"], 8080)
+        self.assertNotIn("hosts", report_data["run"])
         self.assertEqual([item["host"] for item in report_data["hosts"]],
                          ["missing.htb", "good.htb"])
         self.assertEqual(report_data["hosts"][0]["stages"]["resolution"]["status"], "error")
         by_host = {item["host"]: item for item in
                    (json.loads(path.read_text(encoding="utf-8")) for path in summaries)}
-        self.assertEqual(report_data["hosts"],
-                         [by_host["missing.htb"], by_host["good.htb"]])
+        self.assertEqual([item["host"] for item in report_data["hosts"]],
+                         [by_host["missing.htb"]["host"], by_host["good.htb"]["host"]])
+        self.assertIn("inventory", report_data["hosts"][1]["web"]["http"])
         failed = next(json.loads(path.read_text(encoding="utf-8")) for path in summaries
                       if "missing.htb" in path.parent.name)
         self.assertEqual(failed["stages"]["resolution"]["status"], "error")
-        self.assertTrue((out_dir / "new-hosts.txt").is_file())
+        self.assertEqual(report_data["new_hosts"], [])
+        for redundant in ("run.json", "report.md", "new-hosts.txt", "new-hosts.jsonl"):
+            self.assertFalse((out_dir / redundant).exists(), redundant)
         events = [json.loads(line) for line in (out_dir / "progress.jsonl").read_text().splitlines()]
         self.assertTrue(any(item["host"] == "missing.htb" and item["stage"] == "resolution"
                             and item["event"] == "finish" and item["status"] == "error"

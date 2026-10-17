@@ -12,11 +12,12 @@ import sys
 import uuid
 import xml.etree.ElementTree as ET
 from collections import deque
-from dataclasses import dataclass, field
-from html.parser import HTMLParser
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
+
+from .extract import LinkParser, clean_url, empty_inventory, parse_html
 
 MAX_PAGES = 50
 MAX_DEPTH = 2
@@ -188,65 +189,6 @@ def same_origin(url: str, origin: str) -> bool:
         return False
 
 
-def clean_url(url: str, base: str) -> str | None:
-    try:
-        candidate = urljoin(base, url.strip())
-        parts = urlsplit(candidate)
-        if parts.scheme not in ("http", "https") or not parts.hostname:
-            return None
-        if parts.username or parts.password:
-            return None
-        return urlunsplit((parts.scheme, parts.netloc, parts.path or "/", parts.query, ""))
-    except ValueError:
-        return None
-
-
-class LinkParser(HTMLParser):
-    def __init__(self):
-        super().__init__(convert_charrefs=True)
-        self.links: list[tuple[str, str]] = []
-        self.scripts: list[str] = []
-        self.forms: list[dict] = []
-        self.comments: list[str] = []
-        self.fields: list[dict] = []
-        self.title = ""
-        self._in_title = False
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        data = dict(attrs)
-        if tag == "title":
-            self._in_title = True
-        if tag in ("a", "area", "link", "iframe") and data.get("href"):
-            self.links.append((data["href"], tag))
-        if tag == "iframe" and data.get("src"):
-            self.links.append((data["src"], tag))
-        if tag == "script" and data.get("src"):
-            self.scripts.append(data["src"])
-        if tag == "form":
-            self.forms.append({key: data.get(key) for key in ("action", "method")})
-        if tag in ("input", "select", "textarea") and data.get("name"):
-            self.fields.append({"tag": tag, "name": data["name"], "type": data.get("type")})
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag == "title":
-            self._in_title = False
-
-    def handle_data(self, data: str) -> None:
-        if self._in_title:
-            self.title += data[:500]
-
-    def handle_comment(self, data: str) -> None:
-        self.comments.append(data[:2000])
-
-
-def parse_html(body: bytes) -> LinkParser:
-    parser = LinkParser()
-    parser.feed(body.decode("utf-8", "replace"))
-    parser.close()
-    return parser
-
-
-
 def parse_certificate_sans(certificate_text: str) -> list[str]:
     inside = False
     found = set()
@@ -322,8 +264,9 @@ def probe_origins(host: str, port: int, client: HttpClient,
             "origins": origins}
 
 
-def _robots_urls(body: bytes, base: str) -> tuple[list[str], list[str]]:
-    sitemaps, disallowed = [], []
+def _robots_urls(body: bytes, base: str) -> tuple[list[str], list[tuple[str, str]]]:
+    sitemaps: list[str] = []
+    paths: list[tuple[str, str]] = []
     for raw in body.decode("utf-8", "replace").splitlines():
         line = raw.split("#", 1)[0].strip()
         key, sep, value = line.partition(":")
@@ -334,11 +277,31 @@ def _robots_urls(body: bytes, base: str) -> tuple[list[str], list[str]]:
             found = clean_url(value, base)
             if found:
                 sitemaps.append(found)
-        elif key.lower() == "disallow" and value.startswith("/") and "*" not in value and "$" not in value:
+        elif (key.lower() in ("allow", "disallow") and value.startswith("/")
+              and "*" not in value and "$" not in value):
             found = clean_url(value, base)
             if found:
-                disallowed.append(found)
-    return sitemaps[:30], disallowed[:30]
+                paths.append((found, "robots_" + key.lower()))
+    return sitemaps[:30], paths[:30]
+
+
+def _redirect_target(location: str, requested_url: str, origin: str) -> str | None:
+    target = clean_url(location, requested_url)
+    if target is None or same_origin(target, origin):
+        return target
+    # Apache DirectorySlash may omit the service's nondefault port from an
+    # absolute redirect. Keep that port only for a same-host slash redirect.
+    requested, redirected = urlsplit(requested_url), urlsplit(target)
+    try:
+        no_port = requested.port is not None and redirected.port is None
+    except ValueError:
+        return target
+    if (requested.scheme == redirected.scheme and requested.hostname == redirected.hostname
+            and requested.path not in ("", "/") and not requested.path.endswith("/")
+            and no_port and redirected.path == requested.path + "/"):
+        return urlunsplit((requested.scheme, requested.netloc, redirected.path,
+                           redirected.query, ""))
+    return target
 
 
 def _sitemap_locs(body: bytes, base: str) -> tuple[list[str], bool]:
@@ -374,7 +337,41 @@ def _map_urls(origin: str, url: str, source: str, found_hosts: list[dict],
     return False
 
 
-def _announce_root(origin: str, root: Response,
+def _html_response(response: Response) -> bool:
+    return (response.content_type in ("text/html", "application/xhtml+xml")
+            or response.body[:1024].lstrip().lower().startswith((b"<!doctype html", b"<html")))
+
+
+def _emit_inventory(inventory: dict[str, list[dict]],
+                    on_candidate: Callable[[dict], None] | None) -> None:
+    if on_candidate is None:
+        return
+    for category in ("emails", "external_files", "images", "videos", "audio"):
+        for entry in inventory[category]:
+            on_candidate({"kind": "inventory", "category": category, **entry})
+
+
+def _map_external_asset_hosts(origin: str, inventory: dict[str, list[dict]],
+                              found_hosts: list[dict],
+                              on_candidate: Callable[[dict], None] | None) -> None:
+    source_names = {"external_files": "external_file_reference", "images": "image_reference",
+                    "videos": "video_reference", "audio": "audio_reference"}
+    observed = {(item["name"], item["source"]) for item in found_hosts}
+    for category, source in source_names.items():
+        for item in inventory.get(category, []):
+            url = item.get("value", "")
+            if same_origin(url, origin):
+                continue
+            hostname = urlsplit(url).hostname
+            if hostname and (hostname, source) not in observed:
+                observed.add((hostname, source))
+                found_hosts.append({"name": hostname, "source": source})
+                if on_candidate is not None:
+                    on_candidate({"kind": "hostname", "name": hostname, "source": source})
+
+
+def _announce_root(origin: str, root: Response, parsed: LinkParser | None,
+                   inventory: dict[str, list[dict]],
                    on_candidate: Callable[[dict], None] | None) -> None:
     """Show clues already available from the scheme probe before fixed checks."""
     if on_candidate is None or root.exit_code or root.truncated:
@@ -387,13 +384,13 @@ def _announce_root(origin: str, root: Response,
             observed[key] = public[key]
     on_candidate(observed)
     if root.location:
-        target = clean_url(root.location, root.url)
+        target = _redirect_target(root.location, root.url, origin)
         if target:
             _map_urls(origin, target, "redirect", [], [], on_candidate)
-    if (root.content_type not in ("text/html", "application/xhtml+xml") and
-            not root.body[:1024].lstrip().lower().startswith((b"<!doctype html", b"<html"))):
+    if parsed is None:
         return
-    parsed = parse_html(root.body)
+    _emit_inventory(inventory, on_candidate)
+    reference_base = parsed.reference_base(root.url)
     if parsed.title:
         on_candidate({"kind": "title", "source": "html_title", "url": root.url,
                       "title": parsed.title[:500]})
@@ -403,9 +400,10 @@ def _announce_root(origin: str, root: Response,
     for comment in parsed.comments[:100]:
         if comment.strip():
             on_candidate({"kind": "comment", "source": "html_comment", "url": root.url,
-                          "text": comment})
+                          "text": comment[:2000]})
     for form in parsed.forms:
-        action = clean_url(form.get("action") or root.url, root.url)
+        action = (clean_url(form["action"], reference_base)
+                  if form.get("action") else root.url)
         if action:
             if same_origin(action, origin):
                 on_candidate({"kind": "url", "url": action, "source": "form_action",
@@ -413,11 +411,11 @@ def _announce_root(origin: str, root: Response,
             else:
                 _map_urls(origin, action, "form_action", [], [], on_candidate)
     for raw, kind in parsed.links:
-        target = clean_url(raw, root.url)
+        target = clean_url(raw, reference_base)
         if target:
             _map_urls(origin, target, kind + "_link", [], [], on_candidate)
     for raw in parsed.scripts:
-        target = clean_url(raw, root.url)
+        target = clean_url(raw, reference_base)
         if target:
             _map_urls(origin, target, "script_src", [], [], on_candidate)
     for comment in parsed.comments:
@@ -437,13 +435,19 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
     diagnostics: list[str] = []
     partial = False
     partial_reasons: set[str] = set()
-    _announce_root(origin, root, on_candidate)
+    root_parser = (parse_html(root.body) if not root.exit_code and not root.truncated
+                   and _html_response(root) else None)
+    inventory = (root_parser.inventory(root.url, root.prefix) if root_parser
+                 else empty_inventory())
+    _announce_root(origin, root, root_parser, inventory, on_candidate)
+    _map_external_asset_hosts(origin, inventory, found_hosts, on_candidate)
     try:
         baselines = [client.fetch(origin + "/web-recon-missing-" + uuid.uuid4().hex, "missing-control")
                      for _ in range(2)]
     except BudgetExceeded as exc:
-        return {"status": "error", "diagnostics": [str(exc)], "found_hosts": [],
-                "candidate_urls": [], "fixed": [], "pages": [], "scripts": [], "source_maps": []}
+        return {"status": "error", "diagnostics": [str(exc)], "found_hosts": found_hosts,
+                "candidate_urls": [], "fixed": [], "pages": [], "scripts": [],
+                "source_maps": [], "inventory": inventory}
     baseline_public = [x.public() for x in baselines]
     for response in baselines:
         if response.exit_code or response.truncated:
@@ -452,6 +456,7 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
             candidate_urls.append({"url": response.url, "source": "incomplete_body"})
     fetched_fixed: dict[str, Response] = {}
     sitemap_queue: deque[tuple[str, int]] = deque()
+    robots_pages: list[str] = []
     for path in FIXED_PATHS:
         url = origin + path
         try:
@@ -475,14 +480,15 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
         if path.startswith("/sitemap") and result["assessment"] == "candidate":
             sitemap_queue.append((url, 0))
         if path == "/robots.txt" and result["assessment"] == "candidate":
-            sitemaps, disallowed = _robots_urls(response.body, url)
+            sitemaps, paths = _robots_urls(response.body, url)
             for item in sitemaps:
                 if _map_urls(origin, item, "robots_sitemap", found_hosts, candidate_urls,
                              on_candidate):
                     sitemap_queue.append((item, 0))
-            for item in disallowed:
-                _map_urls(origin, item, "robots_disallow", found_hosts, candidate_urls,
-                          on_candidate)
+            for item, source in paths:
+                if _map_urls(origin, item, source, found_hosts, candidate_urls,
+                             on_candidate):
+                    robots_pages.append(item)
     sitemap_results = []
     seen_sitemaps = set()
     while sitemap_queue and len(seen_sitemaps) < 10:
@@ -516,6 +522,13 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
     scripts = []
     source_maps = []
     page_queue: deque[tuple[str, int, Response | None]] = deque([(origin + "/", 0, root)])
+    unique_robots_pages = [url for url in dict.fromkeys(robots_pages)
+                           if url != origin + "/"]
+
+    def queue_robots_after_root(url: str) -> None:
+        if url == origin + "/" and max_depth >= 1:
+            page_queue.extend((item, 1, None) for item in unique_robots_pages)
+
     seen_pages = set()
     seen_scripts = set()
     while page_queue and len(pages) < max_pages:
@@ -535,6 +548,7 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
             partial = True
             partial_reasons.add("incomplete_body")
             candidate_urls.append({"url": url, "source": "incomplete_body"})
+            queue_robots_after_root(url)
             continue
         page = {"url": url, "depth": depth, **response.public()}
         pages.append(page)
@@ -549,17 +563,25 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
                 observed["cookie_names"] = page["cookie_names"]
             on_candidate(observed)
         if response.location:
-            target = clean_url(response.location, url)
+            target = _redirect_target(response.location, url, origin)
             if target and _map_urls(origin, target, "redirect", found_hosts,
                                     candidate_urls, on_candidate) and depth < max_depth:
                 page_queue.append((target, depth + 1, None))
-        if response.content_type not in ("text/html", "application/xhtml+xml") and not response.body[:1024].lstrip().lower().startswith((b"<!doctype html", b"<html")):
+        if not _html_response(response):
+            queue_robots_after_root(url)
             continue
-        parsed = parse_html(response.body)
+        parsed = root_parser if response is root and root_parser is not None else parse_html(response.body)
+        page_inventory = parsed.inventory(url, response.prefix)
+        reference_base = parsed.reference_base(url)
+        if url != root.url:
+            for category, entries in page_inventory.items():
+                inventory[category].extend(entries)
+            _emit_inventory(page_inventory, on_candidate)
+            _map_external_asset_hosts(origin, page_inventory, found_hosts, on_candidate)
         page["title"] = parsed.title[:500]
         page["forms"] = parsed.forms[:100]
         page["fields"] = parsed.fields[:100]
-        page["comments"] = parsed.comments[:100]
+        page["comments"] = [comment[:2000] for comment in parsed.comments[:100]]
         if page["title"] and on_candidate is not None:
             on_candidate({"kind": "title", "source": "html_title", "url": url,
                           "title": page["title"]})
@@ -572,7 +594,8 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
                     on_candidate({"kind": "comment", "source": "html_comment",
                                   "url": url, "text": comment})
         for form in parsed.forms:
-            action = clean_url(form.get("action") or url, url)
+            action = (clean_url(form["action"], reference_base)
+                      if form.get("action") else url)
             if action:
                 if same_origin(action, origin):
                     entry = {"url": action, "source": "form_action",
@@ -584,14 +607,14 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
                     _map_urls(origin, action, "form_action", found_hosts, candidate_urls,
                               on_candidate)
         for raw, kind in parsed.links:
-            target = clean_url(raw, url)
+            target = clean_url(raw, reference_base)
             if not target:
                 continue
             if _map_urls(origin, target, kind + "_link", found_hosts, candidate_urls,
                          on_candidate) and depth < max_depth:
                 page_queue.append((target, depth + 1, None))
         for raw in parsed.scripts:
-            target = clean_url(raw, url)
+            target = clean_url(raw, reference_base)
             if not target:
                 continue
             if _map_urls(origin, target, "script_src", found_hosts, candidate_urls,
@@ -603,10 +626,12 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
                 if target:
                     _map_urls(origin, target, "html_comment", found_hosts, candidate_urls,
                               on_candidate)
-    if page_queue:
+        queue_robots_after_root(url)
+    pending_pages = [item for item in page_queue if item[0] not in seen_pages]
+    if pending_pages:
         partial = True
         partial_reasons.add("crawl_limit")
-    for pending_url, _, _ in page_queue:
+    for pending_url, _, _ in pending_pages:
         candidate_urls.append({"url": pending_url, "source": "crawl_limit"})
     for script_url in sorted(seen_scripts)[:20]:
         try:
@@ -669,5 +694,6 @@ def inspect_origin(origin: str, root: Response, client: HttpClient,
             "partial_reasons": sorted(partial_reasons),
             "fixed": fixed, "sitemaps": sitemap_results, "pages": pages,
             "scripts": scripts, "source_maps": source_maps, "found_hosts": found_hosts,
-            "candidate_urls": candidate_urls, "diagnostics": diagnostics,
+            "candidate_urls": candidate_urls, "inventory": inventory,
+            "diagnostics": diagnostics,
             "request_count": client.request_count}

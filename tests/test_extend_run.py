@@ -14,6 +14,7 @@ from unittest.mock import patch
 from urllib.parse import unquote
 
 from webrecon import cli, report, rerun
+from fixture_report import fixture_overview, load_report, refresh_fixture_hosts, save_fixture_report
 
 
 class ExtendRunTests(unittest.TestCase):
@@ -35,7 +36,7 @@ class ExtendRunTests(unittest.TestCase):
         self._save_source_host(self.failed, "error", "not_run")
         self._save_source_host(self.scanner_failed, "partial", "completed",
                                scanner_status="timeout")
-        (self.source / "run.json").write_text(json.dumps({
+        save_fixture_report(self.source, {
             "port": self.port,
             "wordlists": {"host_prefixes_wordlist": None,
                           "paths_wordlist": None, "extensions_wordlist": None},
@@ -43,7 +44,12 @@ class ExtendRunTests(unittest.TestCase):
                       {"host": self.dns_partial, "status": "partial"},
                       {"host": self.failed, "status": "error"},
                       {"host": self.scanner_failed, "status": "partial"}],
-        }))
+        })
+
+    def _run_cli(self, arguments):
+        if (self.source / "report.json").is_file():
+            refresh_fixture_hosts(self.source)
+        return cli.main(arguments)
 
     def _save_source_host(self, host: str, status: str, dns_status: str,
                           scanner_status: str = "completed") -> None:
@@ -116,16 +122,15 @@ class ExtendRunTests(unittest.TestCase):
         return result
 
     def _keep_only_old(self):
-        index = self.source / "run.json"
-        overview = json.loads(index.read_text())
+        overview = fixture_overview(self.source)
         overview["hosts"] = [entry for entry in overview["hosts"] if entry["host"] == self.old]
-        index.write_text(json.dumps(overview))
+        save_fixture_report(self.source, overview)
         return overview
 
     def test_omitted_ffuf_rate_does_not_inherit_and_override_reuses_completed_host(self):
         overview = self._keep_only_old()
         overview["scan_settings"] = {"ffuf_rate": 7}
-        (self.source / "run.json").write_text(json.dumps(overview))
+        save_fixture_report(self.source, overview)
         output = self.root / "rate-inherited"
         seen = []
 
@@ -134,19 +139,19 @@ class ExtendRunTests(unittest.TestCase):
             return self._scan_host(host, port, run_dir, options, progress)
 
         with patch.object(cli, "run_host", side_effect=scan):
-            code = cli.main(["--extend-run", str(self.source), "--host", self.fresh,
+            code = self._run_cli(["--extend-run", str(self.source), "--host", self.fresh,
                              "--out-dir", str(output)])
         self.assertEqual(code, 0)
         self.assertEqual(seen, [(self.fresh, None)])
-        self.assertIsNone(json.loads((output / "run.json").read_text())["scan_settings"]["ffuf_rate"])
+        self.assertIsNone(fixture_overview(output)["scan_settings"]["ffuf_rate"])
 
         overridden = self.root / "rate-overridden"
         with patch.object(cli, "run_host", side_effect=AssertionError("completed host rescanned")):
-            code = cli.main(["--extend-run", str(self.source), "--host", self.old,
+            code = self._run_cli(["--extend-run", str(self.source), "--host", self.old,
                              "--ffuf-rate", "5", "--out-dir", str(overridden)])
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads((overridden / "run.json").read_text())["hosts"][0]["action"], "reused")
-        self.assertEqual(json.loads((overridden / "run.json").read_text())["scan_settings"]["ffuf_rate"], 5)
+        self.assertEqual(fixture_overview(overridden)["hosts"][0]["action"], "reused")
+        self.assertEqual(fixture_overview(overridden)["scan_settings"]["ffuf_rate"], 5)
 
     def test_reuses_finished_hosts_and_retries_failed_host(self):
         hosts_file = self.root / "hosts.txt"
@@ -157,14 +162,14 @@ class ExtendRunTests(unittest.TestCase):
         original = (rerun._host_dir(self.source, self.old) / "summary.json").read_bytes()
 
         with patch.object(cli, "run_host", side_effect=self._scan_host) as scanner:
-            code = cli.main(["--extend-run", str(self.source),
+            code = self._run_cli(["--extend-run", str(self.source),
                              "--hosts-file", str(hosts_file), "--out-dir", str(output)])
 
         self.assertEqual(code, 0)
         scanned_hosts = [call.args[0] for call in scanner.call_args_list]
         self.assertCountEqual(scanned_hosts, [self.failed, self.scanner_failed, self.fresh])
         self.assertEqual((rerun._host_dir(self.source, self.old) / "summary.json").read_bytes(), original)
-        overview = json.loads((output / "run.json").read_text())
+        overview = fixture_overview(output)
         self.assertEqual(overview["port"], self.port)
         self.assertCountEqual([item["host"] for item in overview["hosts"]],
                               [self.old, self.dns_partial, self.failed,
@@ -175,20 +180,17 @@ class ExtendRunTests(unittest.TestCase):
             self.old: "reused", self.dns_partial: "reused", self.failed: "scanned",
             self.scanner_failed: "scanned", self.fresh: "scanned",
         })
-        report_text = (output / "report.md").read_text()
+        report_data = json.loads((output / "report.json").read_text())
         for host in (self.old, self.dns_partial, self.failed,
                      self.scanner_failed, self.fresh):
-            self.assertIn(host, report_text)
+            self.assertIn(host, [item["host"] for item in report_data["hosts"]])
 
         shutil.rmtree(self.source)
         relocated = self.root / "moved" / "extended"
         relocated.parent.mkdir()
         output.rename(relocated)
-        report.report_existing_run(relocated)
-        for href in re.findall(r"\]\(([^)]+)\)", (relocated / "report.md").read_text()):
-            target = (relocated / unquote(href)).resolve()
-            self.assertTrue(target.is_relative_to(relocated.resolve()), href)
-            self.assertTrue(target.is_file(), href)
+        report.load_json_report(relocated)
+        self.assertEqual(len(json.loads((relocated / "report.json").read_text())["hosts"]), 5)
         for host in (self.old, self.dns_partial):
             summary = json.loads((rerun._host_dir(relocated, host) / "summary.json").read_text())
             prefix = summary["web"]["http"]["pages"][0]["prefix"]
@@ -201,7 +203,7 @@ class ExtendRunTests(unittest.TestCase):
     def test_mismatched_port_rejected_before_creating_output(self):
         output = self.root / "unused"
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            cli.main(["--extend-run", str(self.source), "--host", self.fresh,
+            self._run_cli(["--extend-run", str(self.source), "--host", self.fresh,
                       "--port", "9999", "--out-dir", str(output)])
         self.assertFalse(output.exists())
 
@@ -227,11 +229,11 @@ class ExtendRunTests(unittest.TestCase):
              patch.object(rerun, "run_vhost", side_effect=AssertionError("vhost reran")), \
              patch.object(rerun, "run_extensions", side_effect=AssertionError("extensions reran")), \
              patch.object(rerun, "rerun_dns_words", side_effect=AssertionError("DNS words reran")):
-            code = cli.main(command)
+            code = self._run_cli(command)
         self.assertEqual(code, 0)
         self.assertNotIn(self.old, scanned)
         self.assertIn(f"http://{self.old}:{self.port}", path_origins)
-        overview = json.loads((output / "run.json").read_text())
+        overview = fixture_overview(output)
         self.assertEqual(overview["wordlists"]["paths_wordlist"],
                          str((explicit_words or source_words).resolve()))
         self.assertEqual(next(item for item in overview["hosts"]
@@ -245,42 +247,38 @@ class ExtendRunTests(unittest.TestCase):
         source_words.write_text("old\n")
         changed_words = self.root / "changed-paths.txt"
         changed_words.write_text("new\n")
-        index = self.source / "run.json"
-        overview = json.loads(index.read_text())
+        overview = fixture_overview(self.source)
         overview["wordlists"]["paths_wordlist"] = str(source_words)
-        index.write_text(json.dumps(overview))
+        save_fixture_report(self.source, overview)
         self._scan_with_changed_paths(source_words, self.root / "changed-wordlist",
                                       explicit_words=changed_words)
 
     def test_same_path_content_change_uses_saved_hash(self):
         source_words = self.root / "source-paths.txt"
         source_words.write_text("old\n")
-        index = self.source / "run.json"
-        overview = json.loads(index.read_text())
+        overview = fixture_overview(self.source)
         overview["wordlists"]["paths_wordlist"] = str(source_words)
         overview["wordlist_hashes"] = cli.hash_wordlists(overview["wordlists"])
-        index.write_text(json.dumps(overview))
+        save_fixture_report(self.source, overview)
         source_words.write_text("new\n")
         self._scan_with_changed_paths(source_words, self.root / "changed-contents")
 
-    def test_legacy_source_explicit_same_path_updates_stage(self):
+    def test_missing_hash_explicit_same_path_updates_stage(self):
         source_words = self.root / "source-paths.txt"
         source_words.write_text("old\n")
-        index = self.source / "run.json"
-        overview = json.loads(index.read_text())
+        overview = fixture_overview(self.source)
         overview["wordlists"]["paths_wordlist"] = str(source_words)
         self.assertNotIn("wordlist_hashes", overview)
-        index.write_text(json.dumps(overview))
+        save_fixture_report(self.source, overview)
         self._scan_with_changed_paths(source_words, self.root / "legacy-same-path",
                                       explicit_words=source_words)
 
     def test_new_host_inherits_source_wordlist(self):
         source_words = self.root / "source-paths.txt"
         source_words.write_text("saved\n")
-        index = self.source / "run.json"
-        overview = json.loads(index.read_text())
+        overview = fixture_overview(self.source)
         overview["wordlists"]["paths_wordlist"] = str(source_words)
-        index.write_text(json.dumps(overview))
+        save_fixture_report(self.source, overview)
         seen = []
 
         def scan(host, port, run_dir, options, progress):
@@ -288,15 +286,15 @@ class ExtendRunTests(unittest.TestCase):
             return self._scan_host(host, port, run_dir, options, progress)
 
         with patch.object(cli, "run_host", side_effect=scan):
-            code = cli.main(["--extend-run", str(self.source), "--host", self.fresh,
+            code = self._run_cli(["--extend-run", str(self.source), "--host", self.fresh,
                              "--out-dir", str(self.root / "extended-single")])
 
         self.assertEqual(code, 0)
         self.assertIn((self.fresh, source_words), seen)
-        saved = json.loads((self.root / "extended-single" / "run.json").read_text())
+        saved = fixture_overview(self.root / "extended-single")
         self.assertIsNone(saved["wordlist_hashes"]["paths_wordlist"])
 
-    def test_new_hosts_file_excludes_hostname_scanned_in_extended_run(self):
+    def test_report_new_hosts_excludes_hostname_scanned_in_extended_run(self):
         summary_path = rerun._host_dir(self.source, self.old) / "summary.json"
         summary = json.loads(summary_path.read_text())
         summary["new_hosts"] = [
@@ -309,26 +307,26 @@ class ExtendRunTests(unittest.TestCase):
         output = self.root / "new-hosts-extended"
 
         with patch.object(cli, "run_host", side_effect=self._scan_host):
-            self.assertEqual(cli.main(["--extend-run", str(self.source),
+            self.assertEqual(self._run_cli(["--extend-run", str(self.source),
                                        "--host", self.fresh,
                                        "--out-dir", str(output)]), 0)
 
-        self.assertEqual((output / "new-hosts.txt").read_text().splitlines(),
+        self.assertEqual([item["name"] for item in load_report(output)["new_hosts"]],
                          ["other.example.test"])
+        self.assertFalse((output / "new-hosts.txt").exists())
 
     def test_dns_partial_retries_but_dns_unavailable_is_reused(self):
         dns_failed = "dns-partial.example.test"
         self._save_source_host(dns_failed, "partial", "partial")
-        index = self.source / "run.json"
-        overview = json.loads(index.read_text())
+        overview = fixture_overview(self.source)
         overview["hosts"].append({"host": dns_failed, "status": "partial"})
-        index.write_text(json.dumps(overview))
+        save_fixture_report(self.source, overview)
         hosts_file = self.root / "dns-hosts.txt"
         hosts_file.write_text(self.dns_partial + "\n" + dns_failed + "\n")
         output = self.root / "dns-extended"
 
         with patch.object(cli, "run_host", side_effect=self._scan_host) as scanner:
-            self.assertEqual(cli.main(["--extend-run", str(self.source),
+            self.assertEqual(self._run_cli(["--extend-run", str(self.source),
                                        "--hosts-file", str(hosts_file),
                                        "--out-dir", str(output)]), 0)
 
@@ -336,7 +334,7 @@ class ExtendRunTests(unittest.TestCase):
         self.assertIn(dns_failed, scanned_hosts)
         self.assertNotIn(self.dns_partial, scanned_hosts)
         actions = {item["host"]: item["action"]
-                   for item in json.loads((output / "run.json").read_text())["hosts"]}
+                   for item in fixture_overview(output)["hosts"]}
         self.assertEqual(actions[self.dns_partial], "reused")
         self.assertEqual(actions[dns_failed], "scanned")
 
@@ -347,15 +345,15 @@ class ExtendRunTests(unittest.TestCase):
         overview["wordlists"]["paths_wordlist"] = str(words)
         overview["wordlist_hashes"] = cli.hash_wordlists(overview["wordlists"])
         saved_hash = overview["wordlist_hashes"]["paths_wordlist"]
-        (self.source / "run.json").write_text(json.dumps(overview))
+        save_fixture_report(self.source, overview)
         words.unlink()
 
         output = self.root / "reuse-with-missing-wordlist"
         with patch.object(cli, "run_host", side_effect=AssertionError("unexpected rescan")):
-            code = cli.main(["--extend-run", str(self.source), "--host", self.old,
+            code = self._run_cli(["--extend-run", str(self.source), "--host", self.old,
                              "--out-dir", str(output)])
         self.assertEqual(code, 0)
-        saved = json.loads((output / "run.json").read_text())
+        saved = fixture_overview(output)
         self.assertEqual(saved["hosts"][0]["action"], "reused")
         self.assertEqual(saved["wordlist_hashes"]["paths_wordlist"], saved_hash)
 
@@ -371,7 +369,7 @@ class ExtendRunTests(unittest.TestCase):
                                      paths_wordlist=str(old_paths))
         overview["wordlist_hashes"] = cli.hash_wordlists(overview["wordlists"])
         prefix_hash = overview["wordlist_hashes"]["host_prefixes_wordlist"]
-        (self.source / "run.json").write_text(json.dumps(overview))
+        save_fixture_report(self.source, overview)
         host_summary = rerun._host_dir(self.source, self.old) / "summary.json"
         summary = json.loads(host_summary.read_text())
         summary["dns"]["scanner"] = {"status": "completed"}
@@ -382,10 +380,10 @@ class ExtendRunTests(unittest.TestCase):
         with patch.object(cli, "run_host", side_effect=AssertionError("unexpected rescan")), \
              patch.object(rerun, "run_paths", return_value={"status": "completed", "candidates": []}), \
              patch.object(rerun, "run_vhost", side_effect=AssertionError("prefix scan ran")):
-            code = cli.main(["--extend-run", str(self.source), "--host", self.old,
+            code = self._run_cli(["--extend-run", str(self.source), "--host", self.old,
                              "--paths-wordlist", str(new_paths), "--out-dir", str(output)])
         self.assertEqual(code, 0)
-        saved = json.loads((output / "run.json").read_text())
+        saved = fixture_overview(output)
         self.assertEqual(saved["hosts"][0]["action"], "updated")
         self.assertEqual(saved["wordlist_hashes"]["host_prefixes_wordlist"], prefix_hash)
 
@@ -401,7 +399,7 @@ class ExtendRunTests(unittest.TestCase):
                                      extensions_wordlist=str(extensions),
                                      extension_names_wordlist=str(override))
         overview["wordlist_hashes"] = cli.hash_wordlists(overview["wordlists"])
-        (self.source / "run.json").write_text(json.dumps(overview))
+        save_fixture_report(self.source, overview)
         override.write_text("second\n")
         used_names = []
 
@@ -414,11 +412,11 @@ class ExtendRunTests(unittest.TestCase):
         with patch.object(cli, "run_host", side_effect=AssertionError("unexpected rescan")), \
              patch.object(rerun, "run_extensions", side_effect=extensions_scan), \
              patch.object(rerun, "run_paths", side_effect=AssertionError("path scan ran")):
-            code = cli.main(["--extend-run", str(self.source), "--host", self.old,
+            code = self._run_cli(["--extend-run", str(self.source), "--host", self.old,
                              "--out-dir", str(output)])
         self.assertEqual(code, 0)
         self.assertEqual(used_names, [override])
-        saved = json.loads((output / "run.json").read_text())
+        saved = fixture_overview(output)
         self.assertEqual(saved["hosts"][0]["action"], "updated")
         self.assertEqual(saved["wordlist_hashes"]["extension_names_wordlist"],
                          cli.hash_wordlists({"extension_names_wordlist": str(override)})[
@@ -430,7 +428,7 @@ class ExtendRunTests(unittest.TestCase):
         with patch.object(cli, "run_host", side_effect=AssertionError("unexpected rescan")), \
              patch("webrecon.public.run_public_sources",
                    return_value={"status": "completed", "candidates": [], "artifacts": []}):
-            code = cli.main(["--extend-run", str(self.source), "--host", self.old,
+            code = self._run_cli(["--extend-run", str(self.source), "--host", self.old,
                              "--public-sources", "--out-dir", str(output)])
         self.assertEqual(code, 0)
         summary = json.loads((rerun._host_dir(output, self.old) / "summary.json").read_text())
@@ -454,10 +452,10 @@ class ExtendRunTests(unittest.TestCase):
 
         output = self.root / "bounded-crawl"
         with patch.object(cli, "run_host", side_effect=AssertionError("bounded crawl repeated")):
-            code = cli.main(["--extend-run", str(self.source), "--host", self.old,
+            code = self._run_cli(["--extend-run", str(self.source), "--host", self.old,
                              "--out-dir", str(output)])
         self.assertEqual(code, 0)
-        saved = json.loads((output / "run.json").read_text())
+        saved = fixture_overview(output)
         self.assertEqual(saved["hosts"][0]["action"], "reused")
 
     def test_incomplete_web_body_is_rescanned(self):
@@ -471,11 +469,11 @@ class ExtendRunTests(unittest.TestCase):
 
         output = self.root / "incomplete-body"
         with patch.object(cli, "run_host", side_effect=self._scan_host) as scanner:
-            code = cli.main(["--extend-run", str(self.source), "--host", self.old,
+            code = self._run_cli(["--extend-run", str(self.source), "--host", self.old,
                              "--out-dir", str(output)])
         self.assertEqual(code, 0)
         scanner.assert_called_once()
-        saved = json.loads((output / "run.json").read_text())
+        saved = fixture_overview(output)
         self.assertEqual(saved["hosts"][0]["action"], "scanned")
 
     def test_changed_web_limit_rescans_and_omitted_limit_inherits(self):
@@ -488,21 +486,21 @@ class ExtendRunTests(unittest.TestCase):
         summary["scan_settings"] = profile
         summary_path.write_text(json.dumps(summary))
         overview["scan_settings"] = profile
-        (self.source / "run.json").write_text(json.dumps(overview))
+        save_fixture_report(self.source, overview)
 
         inherited = self.root / "inherited-limit"
         with patch.object(cli, "run_host", side_effect=AssertionError("unexpected rescan")):
-            self.assertEqual(cli.main(["--extend-run", str(self.source), "--host", self.old,
+            self.assertEqual(self._run_cli(["--extend-run", str(self.source), "--host", self.old,
                                        "--out-dir", str(inherited)]), 0)
-        self.assertEqual(json.loads((inherited / "run.json").read_text())[
+        self.assertEqual(fixture_overview(inherited)[
             "scan_settings"]["web"]["max_pages"], 10)
 
         changed = self.root / "changed-limit"
         with patch.object(cli, "run_host", side_effect=self._scan_host) as scanner:
-            self.assertEqual(cli.main(["--extend-run", str(self.source), "--host", self.old,
+            self.assertEqual(self._run_cli(["--extend-run", str(self.source), "--host", self.old,
                                        "--max-pages", "20", "--out-dir", str(changed)]), 0)
         scanner.assert_called_once()
-        self.assertEqual(json.loads((changed / "run.json").read_text())[
+        self.assertEqual(fixture_overview(changed)[
             "hosts"][0]["action"], "scanned")
 
     def test_changed_extra_request_limit_updates_extensions_only(self):
@@ -517,7 +515,7 @@ class ExtendRunTests(unittest.TestCase):
                            "max_body_bytes": 1024 * 1024, "max_requests": 200},
                    "max_extra_requests": 100, "public_sources": False}
         overview["scan_settings"] = profile
-        (self.source / "run.json").write_text(json.dumps(overview))
+        save_fixture_report(self.source, overview)
         summary_path = rerun._host_dir(self.source, self.old) / "summary.json"
         summary = json.loads(summary_path.read_text())
         summary["scan_settings"] = profile
@@ -528,7 +526,7 @@ class ExtendRunTests(unittest.TestCase):
              patch.object(rerun, "run_extensions",
                           return_value={"status": "completed", "candidates": []}) as extension_scan, \
              patch.object(rerun, "run_paths", side_effect=AssertionError("path scan ran")):
-            self.assertEqual(cli.main(["--extend-run", str(self.source), "--host", self.old,
+            self.assertEqual(self._run_cli(["--extend-run", str(self.source), "--host", self.old,
                                        "--max-extra-requests", "200", "--out-dir", str(output)]), 0)
         extension_scan.assert_called_once()
         self.assertEqual(json.loads((rerun._host_dir(output, self.old) /
@@ -540,7 +538,7 @@ class ExtendRunTests(unittest.TestCase):
         with patch.object(cli, "run_host", side_effect=AssertionError("unexpected rescan")), \
              patch("webrecon.public.run_public_sources",
                    return_value={"status": "unavailable", "candidates": [], "artifacts": []}):
-            code = cli.main(["--extend-run", str(self.source), "--host", self.old,
+            code = self._run_cli(["--extend-run", str(self.source), "--host", self.old,
                              "--public-sources", "--out-dir", str(output)])
         self.assertEqual(code, 0)
         summary = json.loads((rerun._host_dir(output, self.old) / "summary.json").read_text())
@@ -553,7 +551,7 @@ class ExtendRunTests(unittest.TestCase):
                            "max_body_bytes": 1024 * 1024, "max_requests": 200},
                    "max_extra_requests": 100000, "public_sources": False}
         overview["scan_settings"] = profile
-        (self.source / "run.json").write_text(json.dumps(overview))
+        save_fixture_report(self.source, overview)
         source_summary_path = rerun._host_dir(self.source, self.old) / "summary.json"
         original = json.loads(source_summary_path.read_text())
         original["scan_settings"] = profile
@@ -568,7 +566,7 @@ class ExtendRunTests(unittest.TestCase):
 
         output = self.root / "failed-full-retry"
         with patch.object(cli, "run_host", side_effect=failed_scan):
-            code = cli.main(["--extend-run", str(self.source), "--host", self.old,
+            code = self._run_cli(["--extend-run", str(self.source), "--host", self.old,
                              "--max-pages", "20", "--out-dir", str(output)])
         self.assertEqual(code, 1)
         kept = json.loads((rerun._host_dir(output, self.old) / "summary.json").read_text())
@@ -577,7 +575,7 @@ class ExtendRunTests(unittest.TestCase):
         self.assertEqual((output / kept["retry"]["summary"]).is_file(), True)
         self.assertEqual((output / (kept["web"]["http"]["pages"][0]["prefix"] + ".body"))
                          .read_text(), "saved response")
-        self.assertIn("retry summary", (output / "report.md").read_text())
+        self.assertIn("retry", json.loads((output / "report.json").read_text())["hosts"][0])
 
     def test_failed_path_update_keeps_prior_result(self):
         overview = self._keep_only_old()
@@ -586,11 +584,11 @@ class ExtendRunTests(unittest.TestCase):
         new_words = self.root / "new-words.txt"
         new_words.write_text("portal\n")
         overview["wordlists"]["paths_wordlist"] = str(old_words)
-        (self.source / "run.json").write_text(json.dumps(overview))
+        save_fixture_report(self.source, overview)
         output = self.root / "failed-path-update"
         with patch.object(rerun, "run_paths",
                           return_value={"status": "error", "candidates": [], "artifacts": []}):
-            code = cli.main(["--extend-run", str(self.source), "--host", self.old,
+            code = self._run_cli(["--extend-run", str(self.source), "--host", self.old,
                              "--paths-wordlist", str(new_words), "--out-dir", str(output)])
         self.assertEqual(code, 1)
         kept = json.loads((rerun._host_dir(output, self.old) / "summary.json").read_text())
@@ -604,7 +602,7 @@ class ExtendRunTests(unittest.TestCase):
         with patch.object(cli, "run_host", side_effect=AssertionError("unexpected full scan")), \
              patch.object(rerun, "run_paths",
                           return_value={"status": "completed", "candidates": [], "artifacts": []}) as path_scan:
-            second_code = cli.main(["--extend-run", str(output), "--host", self.old,
+            second_code = self._run_cli(["--extend-run", str(output), "--host", self.old,
                                     "--out-dir", str(recovered)])
         self.assertEqual(second_code, 0)
         path_scan.assert_called_once()
@@ -613,9 +611,9 @@ class ExtendRunTests(unittest.TestCase):
         self.assertNotIn("retry", final)
         shutil.rmtree(self.source)
         shutil.rmtree(output)
-        report.report_existing_run(recovered)
-        for href in re.findall(r"\]\(([^)]+)\)", (recovered / "report.md").read_text()):
-            self.assertTrue((recovered / unquote(href)).is_file(), href)
+        report.load_json_report(recovered)
+        self.assertEqual(json.loads((recovered / "report.json").read_text())["hosts"][0]["host"],
+                         self.old)
 
     def test_failed_dns_words_retries_without_repeating_vhost(self):
         overview = self._keep_only_old()
@@ -623,7 +621,7 @@ class ExtendRunTests(unittest.TestCase):
         prefixes.write_text("admin\n")
         overview["wordlists"]["host_prefixes_wordlist"] = str(prefixes)
         overview["wordlist_hashes"] = cli.hash_wordlists(overview["wordlists"])
-        (self.source / "run.json").write_text(json.dumps(overview))
+        save_fixture_report(self.source, overview)
         summary_path = rerun._host_dir(self.source, self.old) / "summary.json"
         summary = json.loads(summary_path.read_text())
         summary["status"] = "partial"
@@ -636,7 +634,7 @@ class ExtendRunTests(unittest.TestCase):
         with patch.object(cli, "run_host", side_effect=AssertionError("unexpected full scan")), \
              patch.object(rerun, "rerun_dns_words", return_value=replacement) as dns_scan, \
              patch.object(rerun, "run_vhost", side_effect=AssertionError("vhost repeated")):
-            code = cli.main(["--extend-run", str(self.source), "--host", self.old,
+            code = self._run_cli(["--extend-run", str(self.source), "--host", self.old,
                              "--out-dir", str(output)])
         self.assertEqual(code, 0)
         dns_scan.assert_called_once()
@@ -649,7 +647,7 @@ class ExtendRunTests(unittest.TestCase):
         prefixes.write_text("admin\n")
         overview["wordlists"]["host_prefixes_wordlist"] = str(prefixes)
         overview["wordlist_hashes"] = cli.hash_wordlists(overview["wordlists"])
-        (self.source / "run.json").write_text(json.dumps(overview))
+        save_fixture_report(self.source, overview)
         summary_path = rerun._host_dir(self.source, self.old) / "summary.json"
         summary = json.loads(summary_path.read_text())
         summary["status"] = "partial"
@@ -661,7 +659,7 @@ class ExtendRunTests(unittest.TestCase):
              patch.object(rerun, "rerun_dns_words", side_effect=AssertionError("DNS repeated")), \
              patch.object(rerun, "run_vhost",
                           return_value={"status": "completed", "candidates": []}) as vhost_scan:
-            code = cli.main(["--extend-run", str(self.source), "--host", self.old,
+            code = self._run_cli(["--extend-run", str(self.source), "--host", self.old,
                              "--out-dir", str(output)])
         self.assertEqual(code, 0)
         vhost_scan.assert_called_once()

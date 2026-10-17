@@ -44,7 +44,10 @@ try:
         out = Path(tmp) / "run"
         code = main(["--host", "localhost", "--port", str(server.server_port),
                      "--out-dir", str(out), "--max-pages", "5", "--max-requests", "100"])
-        summary = json.loads(next(out.glob("hosts/*/summary.json")).read_text())
+        report = json.loads((out / "report.json").read_text())
+        assert report["schema_version"] == 2
+        assert report["run"]["port"] == server.server_port
+        summary = report["hosts"][0]
         web = summary["web"]["http"]
         git = next(item for item in web["fixed"] if item["url"].endswith("/.git/HEAD"))
         maps = web["source_maps"]
@@ -53,7 +56,9 @@ try:
         assert git["assessment"] == "candidate", git
         assert len(maps) == 1 and maps[0]["assessment"] == "candidate", maps
         assert maps[0]["sources"] == ["src/app.ts"]
-        assert (out / "new-hosts.txt").exists()
+        assert isinstance(report["new_hosts"], list)
+        for redundant in ("run.json", "report.md", "new-hosts.txt", "new-hosts.jsonl"):
+            assert not (out / redundant).exists(), redundant
         assert code in (0, 1) and summary["dns"]["status"] in {"completed", "unavailable", "partial"}
         print(json.dumps({"exit_code": code, "web_status": web["status"],
                           "dns_status": summary["dns"]["status"], "git": git["assessment"],

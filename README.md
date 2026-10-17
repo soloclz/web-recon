@@ -59,24 +59,38 @@ The filename-guess phase is capped by `--max-extra-requests` (default: 100,000 r
 
 ## Read results
 
-The finished run has two files at its root:
+At the end of a run, the terminal prints a short summary for each host: its status, crawled page count, extracted clues, scanner candidates, and selected diagnostics. Item lists are capped so the output stays readable. The complete result is the single `report.json` at the run root. For example, a run in `~/engagements/example/web-recon-YYYYMMDD-HHMMSS/` has `~/engagements/example/web-recon-YYYYMMDD-HHMMSS/report.json`.
 
-- `report.md` is the reading entry point: host and stage status, candidate tables, and links to the saved evidence. Tables show up to 30 rows.
-- `report.json` contains the complete results for all hosts. Use this single file for `jq`; there is no need to find a per-host `summary.json`.
+The JSON shape is `{"schema_version": 2, "run": {...}, "hosts": [...], "new_hosts": [...]}`. Each `hosts[]` entry contains the host's stage status, Web results, DNS and TLS results, scanner findings, and evidence paths. Each `hosts[].web.<scheme>.inventory` groups clues found in saved HTML into nine lists:
 
-The JSON shape is `{"schema_version": 1, "run": {...}, "hosts": [...]}`. For example:
+| List | Contents |
+| --- | --- |
+| `emails` | Email addresses in page text, comments, or HTML references. |
+| `links` | HTTP(S) links from HTML references. |
+| `external_files` | References with common document, archive, data, stylesheet, or configuration file extensions. |
+| `js_files` | JavaScript references. |
+| `form_fields` | Named form controls, with their form action and method when available. |
+| `images`, `videos`, `audio` | Media references. |
+| `comments` | HTML comments. |
+
+An inventory entry has `value`, `source_url`, and `prefix`; `prefix` points to the saved response files, such as `<prefix>.body`. Entries can also include metadata such as the HTML tag, attribute, form method, or action. Relative HTML references follow the page's first valid `<base href>`, if present. The inventory records references from pages the crawler fetched. An off-origin document or media reference also contributes a hostname candidate, without probing that hostname. The tool does not fetch every referenced asset or execute JavaScript; the existing JavaScript and source map checks still apply.
+
+Query `report.json` with `jq`:
 
 ```bash
-jq -r '.hosts[].new_hosts[].name' ./web-recon-YYYYMMDD-HHMMSS/report.json
-jq -r '.hosts[].web[].pages[].comments[]' ./web-recon-YYYYMMDD-HHMMSS/report.json
-jq '.hosts[] | select(.host == "app.example.test")' ./web-recon-YYYYMMDD-HHMMSS/report.json
+RUN=./web-recon-YYYYMMDD-HHMMSS
+jq -r '.new_hosts[].name' "$RUN/report.json"
+jq -r '.hosts[].web[].inventory.emails[]?.value' "$RUN/report.json"
+jq -r '.hosts[].web[].inventory.comments[]?.value' "$RUN/report.json"
+jq '.hosts[] | select(.host == "app.example.test") | .web.http.inventory.form_fields' "$RUN/report.json"
+jq -r '.hosts[] | .host as $host | .web[]? | .pages[]? | [$host, .url] | @tsv' "$RUN/report.json"
 ```
 
-`new-hosts.txt` lists candidate hostnames not already included as hosts in the merged run. Add the names you want to investigate to your hosts file for the next run. `new-hosts.jsonl` also records where each name came from and the starting host's connected IP:port; that address is not a confirmed address for the candidate.
+`new_hosts` at the report root lists candidate hostnames not already included as hosts in the merged run. Each entry's `observations` records the input host, discovery sources, and that input host's connected IP:port. The address is a starting point for checking the candidate, not a confirmed address for it. The first `jq` example above prints the names; redirect its output to a file if you want a list to review and add to your hosts file for the next run.
 
-The run root also contains `run.json` (run metadata and completion state) and `progress.jsonl` (live events). Under `hosts/<hostname>-<hash>/`, each host has a `summary.json` and the original Web responses, TLS data, DNS output, and scanner output. The tool keeps these files so a later run can reuse evidence and so you can verify a candidate against its missing-path or default-vhost control. Normal reading and `jq` queries start at the run root.
+The run root contains `report.json` and `progress.jsonl` (live events). `report.json.run` holds the run settings; `report.json.hosts[]` holds each host's status and results. Under `hosts/<hostname>-<hash>/`, each host has an internal `summary.json` and the original Web responses, TLS data, DNS output, and scanner output. These files let later runs reuse evidence and let you verify a candidate against its missing-path or default-vhost control. Start normal reading and `jq` queries with `report.json`; inspect a host directory when you need the raw evidence.
 
-A `candidate` needs review against its saved response or scanner control. An `observed` event is data read directly from DNS or a Web response. A host can have status `partial` because one stage is unavailable even when other stages finished; check the stage table in `report.md`.
+A `candidate` needs review against its saved response or scanner control. An `observed` event is data read directly from DNS or a Web response. A host can have status `partial` because one stage is unavailable even when others finished; inspect that host's stage status and diagnostics in `report.json`.
 
 ### See findings before the scan finishes
 
@@ -94,7 +108,7 @@ tail -f ./web-recon-YYYYMMDD-HHMMSS/progress.jsonl |
   jq --unbuffered -r 'select(.event == "finding") | "[\(.host)] \(.status): \(.display)"'
 ```
 
-`report.md`, `report.json`, and `run.json` are written after all input hosts finish. Use the console or `progress.jsonl` during a long scan.
+`report.json` is written after all input hosts finish and marks a completed run. Use the console or `progress.jsonl` during a long scan.
 
 ## Continue a run
 
@@ -110,7 +124,7 @@ python3 ~/tools/web-recon/scripts/web-recon.py \
   --host-prefixes-wordlist /usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt
 ```
 
-The path and extension wordlists are inherited. The tool runs the **entire** new prefix wordlist for DNS and vhost discovery; it does not subtract words tested in the previous list. Completed path, extension, and fixed checks are reused when their inputs are unchanged. Current runs save each wordlist's SHA-256, so a content change at the same path is detected. For an older run without saved hashes, pass the wordlist flag explicitly to update that stage. Repeating a completed run with unchanged inputs makes a new merged run without repeating its completed checks.
+The path and extension wordlists are inherited. The tool runs the **entire** new prefix wordlist for DNS and vhost discovery; it does not subtract words tested in the previous list. Completed path, extension, and fixed checks are reused when their inputs are unchanged. `report.json.run.wordlist_hashes` saves each wordlist's SHA-256, so a content change at the same path is detected. Repeating a completed run with unchanged inputs makes a new merged run without repeating its completed checks.
 
 To add another known hostname, put it in `hosts.txt` and run:
 
@@ -129,7 +143,7 @@ python3 ~/tools/web-recon/scripts/web-recon.py \
   --hosts-file hosts.txt
 ```
 
-`--extend-run` inherits the source port, wordlists, and scan limits unless you override them. A supplied `--port` must match the source. The source must be a finished run with `run.json`.
+`--extend-run` inherits the source port, wordlists, and scan limits unless you override them. A supplied `--port` must match the source. The source must be a completed run with a schema version 2 `report.json`.
 
 To scan everything again, including pages that may have changed on the server, start a new history and supply the wordlists again:
 
@@ -157,7 +171,7 @@ python3 ~/tools/web-recon/scripts/web-recon.py \
 
 Passing both path and extension flags reruns both stages, and the new path list is used for filename guesses. A prefix flag reruns both Gobuster DNS and ffuf vhost. `--from-run` cannot add a hostname; use ordinary continuation or `--extend-run` for that.
 
-`--only` is an optional legacy selector for one stage. One useful case is an extension rerun when the previous path wordlist is gone: the path flag below supplies a replacement filename list without rerunning the path scan.
+`--only` is an optional selector for one stage. One useful case is an extension rerun when the previous path wordlist is gone: the path flag below supplies a replacement filename list without rerunning the path scan.
 
 ```bash
 python3 ~/tools/web-recon/scripts/web-recon.py \
@@ -174,8 +188,8 @@ A source run still in progress cannot be used for `--from-run` or `--extend-run`
 For each resolvable hostname, the fixed checks:
 
 1. Probe HTTP and HTTPS on the given port; save the root response, redirects, and TLS certificate SAN names. Lab self-signed certificates are accepted for inspection; this check does not validate the certificate trust chain.
-2. Use two random missing paths as controls. Check `robots.txt`, common sitemap locations and `Sitemap:` entries, a small set of `/.well-known/` metadata, `.git/HEAD`, `.env`, OpenAPI/Swagger locations, and common product files. At most 10 sitemap files are read; URLs in sitemaps become candidates rather than new requests.
-3. Crawl the same origin for links, forms, field names, comments, and loaded JavaScript URLs. Check source maps only for discovered JavaScript. The crawler currently does not make separate email or image inventories.
+2. Use two random missing paths as controls. Check `robots.txt`, common sitemap locations and `Sitemap:` entries, a small set of `/.well-known/` metadata, `.git/HEAD`, `.env`, OpenAPI/Swagger locations, and common product files. At most 10 sitemap files are read. URLs in sitemaps become candidates rather than new page requests. Concrete same-origin `Allow:` and `Disallow:` paths in `robots.txt` join the bounded page crawl; wildcard patterns are not queued.
+3. Crawl the same origin for links, forms, field names, comments, and loaded JavaScript URLs. Extract the nine inventory lists described above from fetched HTML. Check source maps only for discovered JavaScript. The crawler does not execute JavaScript or fetch media and document references solely to inventory them.
 4. Query DNS records, PTR, SOA/NS, and a wildcard control. Try AXFR only when the input name is confirmed as a zone and its NS answers with an authoritative SOA. If a hosts entry makes Web access possible but DNS cannot answer for that zone, the DNS stage is `unavailable` while Web and vhost checks continue.
 5. Compare fixed-path and ffuf hits with missing-path or default-vhost controls. A baseline match is not treated as a discovery; scanner errors and incomplete results are saved separately.
 
@@ -185,13 +199,13 @@ DNS and Web checks can overlap within a host. By default, ffuf vhost, path, and 
 
 Add `--public-sources` to a normal invocation to query crt.sh and Wayback CDX for a public hostname. It records candidate names and historical URLs without probing them. The crt.sh result keeps at most 500 candidate names; Wayback keeps at most 500 URLs plus hostname candidates derived from them. Each response is limited to 4 MiB with a 15-second timeout. `.htb`, `.local`, and IP targets are skipped. The current service's TLS certificate SAN check runs regardless of this flag. See [public source details](docs/public-sources.md).
 
-## Regenerate reports for an older run
+## Show a saved run again
 
-A finished run made before `report.json` was added can create both reports from saved summaries without sending requests. Run the module from the repository root:
+Use `--report` to print the terminal summary again from a completed run's schema version 2 `report.json`. This mode reads the existing report without changing files or sending network requests. Use it by itself, without scan options:
 
 ```bash
-cd ~/tools/web-recon
-python3 -m webrecon.report ~/engagements/example/web-recon-YYYYMMDD-HHMMSS
+python3 ~/tools/web-recon/scripts/web-recon.py \
+  --report ~/engagements/example/web-recon-YYYYMMDD-HHMMSS
 ```
 
 ## Verification

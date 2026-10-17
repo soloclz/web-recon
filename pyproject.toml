@@ -1,6 +1,6 @@
 [project]
 name = "web-recon"
-version = "0.1.0"
+version = "0.2.0"
 description = "Bounded host and port Web reconnaissance with saved evidence"
 requires-python = ">=3.10"
 dependencies = []

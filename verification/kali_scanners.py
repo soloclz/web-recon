@@ -6,13 +6,14 @@ from tempfile import mkdtemp
 from threading import Thread
 import json
 import re
+import subprocess
 import sys
 from urllib.parse import unquote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from webrecon.cli import main
 from webrecon.fuzz import run_extensions, run_paths, run_vhost
-from webrecon.report import report_existing_run
+from webrecon.report import load_json_report
 
 
 class Site(BaseHTTPRequestHandler):
@@ -76,6 +77,10 @@ try:
                      "--max-pages", "5", "--max-requests", "100",
                      "--out-dir", str(cli_out)])
     cli_summary = json.loads(next(cli_out.glob("hosts/*/summary.json")).read_text())
+    reported_hosts = subprocess.run(
+        ["jq", "-r", ".new_hosts[].name", str(cli_out / "report.json")],
+        capture_output=True, text=True, check=True).stdout.splitlines()
+    assert "admin.localhost" in reported_hosts, reported_hosts
     cli_scanners = cli_summary["scanners"]["http"]
     path_status = next((cli_out / "hosts").glob("*/scanners/http/paths/paths.status.json"))
     path_argv = json.loads(path_status.read_text())["argv"]
@@ -95,10 +100,10 @@ try:
         summary = json.loads(next(out.glob("hosts/*/summary.json")).read_text())
         rerun_outputs[stage] = {"exit_code": code, "status": summary["status"],
                                 "rerun_status": summary["rerun"]["status"],
-                                "report": str(out / "report.md")}
+                                "report": str(out / "report.json")}
         if stage in ("paths", "extensions"):
             assert code == 0 and summary["rerun"]["status"] == "completed"
-        assert (out / "report.md").is_file()
+        assert (out / "report.json").is_file()
         assert not next(out.glob("hosts/*/responses"), None)
         if stage == "paths":
             assert summary["scanners"]["http"]["extensions"]["filename_rescan"]["status"] == "completed"
@@ -119,21 +124,17 @@ try:
     assert combined_code == 0 and combined_summary["rerun"]["status"] == "completed"
     assert combined_summary["rerun"]["stages"] == ["paths", "extensions"]
     assert "filename_rescan" not in combined_summary["scanners"]["http"]["extensions"]
-    assert (combined_out / "report.md").is_file()
+    assert (combined_out / "report.json").is_file()
     hidden_source = root / "cli-hidden"
     cli_out.rename(hidden_source)
     try:
-        report_existing_run(combined_out)
-        for href in re.findall(r"\]\(([^)]+)\)", (combined_out / "report.md").read_text()):
-            target = (combined_out / unquote(href)).resolve()
-            assert target.is_relative_to(combined_out.resolve()), href
-            assert target.is_file(), href
+        assert load_json_report(combined_out)["schema_version"] == 2
     finally:
         hidden_source.rename(cli_out)
     rerun_outputs["paths+extensions"] = {
         "exit_code": combined_code, "status": combined_summary["status"],
         "rerun_status": combined_summary["rerun"]["status"],
-        "report": str(combined_out / "report.md")}
+        "report": str(combined_out / "report.json")}
     evidence = {
         "fixture_port": server.server_port,
         "vhost": {"status": vhost["status"], "candidates": vhost["candidates"],
@@ -147,7 +148,7 @@ try:
         "progress": {name: [current, total] for name, current, total in scan_progress},
         "cli": {"exit_code": cli_exit, "status": cli_summary["status"],
                 "scanner_status": {name: stage["status"] for name, stage in cli_scanners.items()},
-                "progress_events": len(cli_events)},
+                "progress_events": len(cli_events), "jq_new_hosts": reported_hosts},
         "reruns": rerun_outputs,
     }
     (root / "verification.json").write_text(json.dumps(evidence, indent=2) + "\n")

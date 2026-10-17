@@ -143,15 +143,7 @@ def _web_ready(stage: dict, *, allow_bounded: bool) -> bool:
         return False
     bounded = {"crawl_limit", "script_limit", "sitemap_limit", "request_limit"}
     reasons = stage.get("partial_reasons")
-    if isinstance(reasons, list) and reasons:
-        return set(reasons) <= bounded
-    # Older reports did not save partial_reasons. Their candidate URLs still
-    # identify crawl and request bounds, while incomplete bodies require retry.
-    sources = {item.get("source") for item in stage.get("candidate_urls", [])
-               if isinstance(item, dict)}
-    diagnostics = stage.get("diagnostics") or []
-    return (bool(sources & bounded) and "incomplete_body" not in sources and
-            all("request limit" in str(message) for message in diagnostics))
+    return isinstance(reasons, list) and bool(reasons) and set(reasons) <= bounded
 
 
 def _failed_wordlist_stages(result: dict, options) -> set[str]:
@@ -363,8 +355,7 @@ def extend_main(options) -> int:
     cli.write_run_outputs(run_dir, results, port, wordlists,
                           wordlist_hashes=wordlist_hashes, settings=cli.scan_settings(options),
                           extended_from=source_run)
-    print(f"Report: {run_dir / 'report.md'}", flush=True)
-    print(f"JSON: {run_dir / 'report.json'}", flush=True)
+    cli.print_run_summary(run_dir)
     print(run_dir)
     def successful(result: dict) -> bool:
         action = result.get("action")

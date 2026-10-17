@@ -11,10 +11,12 @@ from pathlib import Path
 
 from .cli import (_add_candidates, _candidate_callback, _observed_basenames, _relative_artifacts,
                   hash_wordlists,
-                  _run_stage, create_run_dir, normalize_host, write_run_outputs)
+                  _run_stage, create_run_dir, normalize_host, print_run_summary,
+                  write_run_outputs)
 from .dns import rerun_dns_words
 from .fuzz import run_extension_filenames, run_extensions, run_paths, run_vhost
 from .progress import ProgressReporter
+from .report import load_json_report
 
 
 _EVIDENCE_KEYS = {"prefix", "artifact", "stdout", "stderr", "meta", "summary"}
@@ -44,14 +46,12 @@ def _source_evidence_paths(value, source_run: Path, key: str = ""):
 def _read_source(source_run: Path) -> tuple[dict, list[dict]]:
     if not source_run.is_dir():
         raise ValueError(f"source run is not a directory: {source_run}")
-    try:
-        overview = json.loads((source_run / "run.json").read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError("--from-run requires a completed run with run.json") from exc
+    report = load_json_report(source_run)
+    overview = report["run"]
     port = overview.get("port")
-    if not isinstance(port, int) or not 1 <= port <= 65535:
+    if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError("source run has no valid port")
-    hosts = overview.get("hosts")
+    hosts = report["hosts"]
     if not isinstance(hosts, list) or not hosts:
         raise ValueError("source run has no host list")
     summaries = []
@@ -63,7 +63,7 @@ def _read_source(source_run: Path) -> tuple[dict, list[dict]]:
         except (KeyError, TypeError, OSError, json.JSONDecodeError, ValueError) as exc:
             raise ValueError(f"source host summary is missing or invalid: {entry!r}") from exc
         if summary.get("host") != host or summary.get("port") != port:
-            raise ValueError(f"source host summary does not match run.json: {host}")
+            raise ValueError(f"source host summary does not match report.json: {host}")
         summaries.append(_source_evidence_paths(summary, source_run))
     return overview, summaries
 
@@ -73,12 +73,13 @@ def _source_roots(source_run: Path) -> list[Path]:
     roots = []
     seen = set()
     current = source_run.resolve()
-    while current not in seen and (current / "run.json").is_file():
+    while current not in seen and (current / "report.json").is_file():
         roots.append(current)
         seen.add(current)
         try:
-            previous = json.loads((current / "run.json").read_text(encoding="utf-8")).get("source_run")
-        except (OSError, json.JSONDecodeError):
+            overview = load_json_report(current)["run"]
+            previous = overview.get("source_run") or overview.get("extended_from")
+        except ValueError:
             break
         if not isinstance(previous, str) or not previous:
             break
@@ -277,6 +278,7 @@ def _run_one(result: dict, source_run: Path, run_dir: Path, overview: dict,
     host_dir = _host_dir(run_dir, host)
     host_dir.mkdir(parents=True, exist_ok=False)
     result = _bundle_evidence(result, run_dir, host_dir, source_roots)
+    result["action"] = "updated"
     result["reused_from"] = str(source_run)
     stages = options.rerun_stages
     result["rerun_stages"] = list(stages)
@@ -451,8 +453,7 @@ def rerun_main(options) -> int:
                       wordlist_hashes=wordlist_hashes,
                       settings=settings,
                       source_run=source_run, rerun_stages=options.rerun_stages)
-    print(f"Report: {run_dir / 'report.md'}", flush=True)
-    print(f"JSON: {run_dir / 'report.json'}", flush=True)
+    print_run_summary(run_dir)
     print(run_dir)
     return 0 if all(item.get("rerun", {}).get("status") == "completed"
                     for item in results) else 1
